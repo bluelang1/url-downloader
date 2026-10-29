@@ -46,11 +46,21 @@ struct App {
     concurrent: usize,
     /// 파일 하나를 몇 개 연결로 나눠 받을지
     segments: usize,
-    help_open: bool,
-    about_open: bool,
+    view: View,
     /// 도움말에서 목차를 눌러 이동할 절 번호
     help_jump: Option<usize>,
+    help_query: String,
     update: Arc<Mutex<UpdateState>>,
+    /// 개발용: 몇 프레임 그린 뒤 화면을 파일로 저장하고 종료 (URL_DOWNLOADER_SCREENSHOT=경로.ppm)
+    screenshot: Option<(PathBuf, u32)>,
+}
+
+/// 메인 영역에 보여줄 화면
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Download,
+    Help,
+    About,
 }
 
 /// 업데이트 확인·적용 진행 상태
@@ -72,9 +82,10 @@ impl Default for App {
             items: Default::default(),
             concurrent: 3,
             segments: 4,
-            help_open: false,
-            about_open: false,
+            view: View::Download,
             help_jump: None,
+            help_query: String::new(),
+            screenshot: std::env::var("URL_DOWNLOADER_SCREENSHOT").ok().map(|p| (PathBuf::from(p), 0)),
             update: Arc::new(Mutex::new(UpdateState::Checking)),
         }
     }
@@ -132,7 +143,12 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            let app = App::default();
+            let mut app = App::default();
+            app.view = match std::env::var("URL_DOWNLOADER_START_VIEW").as_deref() {
+                Ok("help") => View::Help,
+                Ok("about") => View::About,
+                _ => View::Download,
+            };
             app.check_update();
             Ok(Box::new(app))
         }),
@@ -166,6 +182,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.debug_screenshot(ctx);
         let running = self.is_running();
         if running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -173,9 +190,12 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
+                if ui.selectable_label(self.view == View::Download, "다운로드").clicked() {
+                    self.view = View::Download;
+                }
                 ui.menu_button("정보", |ui| {
                     if ui.button("URL Downloader 정보").clicked() {
-                        self.about_open = true;
+                        self.view = View::About;
                         ui.close_menu();
                     }
                     if ui.button("GitHub 저장소 열기").clicked() {
@@ -184,15 +204,15 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("도움말", |ui| {
-                    if ui.button("사용법 전체 보기").clicked() {
-                        self.help_open = true;
+                    if ui.button("사용법 전체 보기   (F1)").clicked() {
+                        self.view = View::Help;
                         self.help_jump = Some(0);
                         ui.close_menu();
                     }
                     ui.separator();
                     for (i, sec) in HELP.iter().enumerate() {
                         if ui.button(format!("{}. {}", i + 1, sec.title)).clicked() {
-                            self.help_open = true;
+                            self.view = View::Help;
                             self.help_jump = Some(i);
                             ui.close_menu();
                         }
@@ -203,8 +223,25 @@ impl eframe::App for App {
                 });
             });
         });
-        self.help_window(ctx);
-        self.about_window(ctx);
+        // 단축키: F1 도움말, Esc 로 다운로드 화면 복귀
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.view = View::Help;
+        }
+        if self.view != View::Download && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.view = View::Download;
+        }
+
+        match self.view {
+            View::Help => {
+                egui::CentralPanel::default().show(ctx, |ui| self.help_view(ui));
+                return;
+            }
+            View::About => {
+                egui::CentralPanel::default().show(ctx, |ui| self.about_view(ui));
+                return;
+            }
+            View::Download => {}
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("링크 목록 (한 줄에 하나)");
@@ -399,22 +436,29 @@ struct Section {
 enum Block {
     Text(&'static str),
     Bullets(&'static [&'static str]),
+    /// 번호가 붙는 순서 목록
+    Steps(&'static [&'static str]),
     Code(&'static str),
 }
-use Block::{Bullets, Code, Text};
+use Block::{Bullets, Code, Steps, Text};
 
 const HELP: &[Section] = &[
     Section {
         title: "시작하기",
         blocks: &[
             Text("URL 목록을 붙여넣고 저장할 폴더만 고르면 한꺼번에 내려받는 프로그램입니다. 큰 파일은 여러 연결로 나눠 받고, 끊기면 받은 곳부터 이어서 받습니다."),
-            Bullets(&[
-                "① 위쪽 입력창에 링크를 한 줄에 하나씩 붙여넣습니다.",
-                "② 필요하면 [동시 파일] / [파일당 분할] 숫자를 조정합니다.",
-                "③ [다운로드 (N개)] 버튼을 누르고 저장할 폴더를 고릅니다.",
-                "④ 아래 목록에서 진행 상황을 확인합니다. 끝나면 [폴더 열기] 로 바로 열 수 있습니다.",
+            Steps(&[
+                "위쪽 입력창에 링크를 한 줄에 하나씩 붙여넣습니다.",
+                "필요하면 [동시 파일] / [파일당 분할] 숫자를 조정합니다.",
+                "[다운로드 (N개)] 버튼을 누르고 저장할 폴더를 고릅니다.",
+                "아래 목록에서 진행 상황을 확인합니다. 끝나면 [폴더 열기] 로 바로 열 수 있습니다.",
             ]),
             Text("버튼의 N 은 입력창에서 URL 로 인식된 줄 수입니다. http:// 또는 https:// 로 시작하지 않는 줄은 무시됩니다."),
+            Bullets(&[
+                "F1: 이 도움말 열기   ·   Esc: 다운로드 화면으로 돌아가기",
+                "도움말·정보 화면을 보는 동안에도 다운로드는 뒤에서 계속 진행됩니다.",
+                "왼쪽 검색창에 단어를 넣으면 그 단어가 들어간 절과 줄만 보여줍니다.",
+            ]),
         ],
     },
     Section {
@@ -499,7 +543,7 @@ const HELP: &[Section] = &[
             Bullets(&[
                 "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 상단 오른쪽에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다. 현재 버전은 그 옆에 항상 표시됩니다.",
                 "버튼을 누르면 새 버전을 받아 지금 실행 중인 .app 을 같은 자리에서 교체하고 자동으로 다시 시작합니다. 진행 중인 다운로드는 끊기므로 끝난 뒤에 누르세요.",
-                "[정보 → URL Downloader 정보] 창에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있습니다.",
+                "[정보 → URL Downloader 정보] 화면에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있습니다.",
                 "cargo run 처럼 .app 번들이 아닌 상태로 실행 중이면 업데이트 버튼은 동작하지 않습니다.",
                 "교체에 실패하면 기존 앱을 그대로 되돌리고 상단에 ⚠ 표시가 뜹니다. 마우스를 올리면 사유가 보입니다.",
             ]),
@@ -521,110 +565,175 @@ const HELP: &[Section] = &[
 ];
 
 impl App {
-    fn help_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.help_open;
-        egui::Window::new("도움말")
-            .open(&mut open)
-            .default_size([680.0, 500.0])
-            .show(ctx, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(150.0);
-                        ui.strong("목차");
-                        ui.add_space(4.0);
-                        for (i, sec) in HELP.iter().enumerate() {
-                            if ui.link(format!("{}. {}", i + 1, sec.title)).clicked() {
-                                self.help_jump = Some(i);
-                            }
-                        }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("help")
-                        .max_height(ui.available_height())
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            for (i, sec) in HELP.iter().enumerate() {
-                                let heading = ui.heading(format!("{}. {}", i + 1, sec.title));
-                                if self.help_jump == Some(i) {
-                                    heading.scroll_to_me(Some(egui::Align::TOP));
-                                    self.help_jump = None;
-                                }
-                                ui.add_space(4.0);
-                                for block in sec.blocks {
-                                    match block {
-                                        Text(t) => {
-                                            ui.label(*t);
-                                        }
-                                        Bullets(items) => {
-                                            for it in items.iter() {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.label("•");
-                                                    ui.label(*it);
-                                                });
-                                            }
-                                        }
-                                        Code(c) => {
-                                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                                ui.set_width(ui.available_width());
-                                                ui.label(egui::RichText::new(*c).monospace());
-                                            });
-                                        }
-                                    }
-                                    ui.add_space(4.0);
-                                }
-                                ui.add_space(14.0);
-                            }
-                        });
-                });
-            });
-        self.help_open = open;
+    fn debug_screenshot(&mut self, ctx: &egui::Context) {
+        let Some((path, frames)) = self.screenshot.as_mut() else { return };
+        *frames += 1;
+        ctx.request_repaint();
+        if *frames == 5 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        }
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = shot {
+            let [w, h] = img.size;
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for px in &img.pixels {
+                out.extend_from_slice(&[px.r(), px.g(), px.b()]);
+            }
+            std::fs::write(path, out).expect("screenshot write");
+            std::process::exit(0);
+        }
     }
 
-    fn about_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.about_open;
-        egui::Window::new("URL Downloader 정보")
-            .open(&mut open)
+    fn back_bar(&mut self, ui: &mut egui::Ui, title: &str) {
+        ui.horizontal(|ui| {
+            if ui.button("← 다운로드 화면으로 (Esc)").clicked() {
+                self.view = View::Download;
+            }
+            ui.add_space(8.0);
+            ui.heading(title);
+            if self.is_running() {
+                ui.label(egui::RichText::new("· 다운로드는 뒤에서 계속 진행 중").color(egui::Color32::LIGHT_BLUE).small());
+            }
+        });
+        ui.separator();
+    }
+
+    /// 도움말 화면: 왼쪽 목차 + 오른쪽 본문 (검색어가 있으면 맞는 줄만)
+    fn help_view(&mut self, ui: &mut egui::Ui) {
+        self.back_bar(ui, "도움말");
+        let query = self.help_query.trim().to_lowercase();
+        let hit = |t: &str| query.is_empty() || t.to_lowercase().contains(&query);
+
+        egui::SidePanel::left("help_toc")
             .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(6.0);
-                    ui.heading("URL Downloader");
-                    ui.label(format!("버전 {VERSION}"));
-                    ui.add_space(4.0);
-                    let state = self.update.lock().unwrap().clone();
-                    match state {
-                        UpdateState::UpToDate => {
-                            ui.label(egui::RichText::new("최신 버전입니다").color(egui::Color32::LIGHT_GREEN));
-                        }
-                        UpdateState::Available { version, .. } => {
-                            ui.label(egui::RichText::new(format!("새 버전 v{version} 이 있습니다 (상단 버튼으로 업데이트)")).color(egui::Color32::LIGHT_BLUE));
-                        }
-                        UpdateState::Error(e) => {
-                            ui.label(egui::RichText::new(format!("업데이트 확인 실패: {e}")).color(egui::Color32::GRAY).small());
-                        }
-                        _ => {}
+            .exact_width(190.0)
+            .show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.help_query)
+                        .hint_text("🔍 검색")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                ui.strong("목차");
+                ui.add_space(2.0);
+                for (i, sec) in HELP.iter().enumerate() {
+                    if ui.link(format!("{}. {}", i + 1, sec.title)).clicked() {
+                        self.help_query.clear();
+                        self.help_jump = Some(i);
                     }
-                    if ui.button("업데이트 확인").clicked() {
-                        self.check_update();
-                    }
-                    ui.add_space(8.0);
-                    ui.label("URL 목록을 붙여넣고 폴더만 고르면 한꺼번에 내려받는 프로그램.");
-                    ui.label("분할 다운로드와 이어받기를 지원합니다.");
-                    ui.add_space(8.0);
-                    ui.hyperlink_to("GitHub: bluelang1/url-downloader", REPO_URL);
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("MIT License  ·  © 2026 bluelang1").color(egui::Color32::GRAY));
-                    ui.label(
-                        egui::RichText::new("Rust · egui/eframe · reqwest · rfd")
-                            .color(egui::Color32::GRAY)
-                            .small(),
-                    );
-                    ui.add_space(6.0);
-                });
+                }
             });
-        self.about_open = open;
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("help_body").show(ui, |ui| {
+                let mut shown = 0;
+                for (i, sec) in HELP.iter().enumerate() {
+                    // 검색 중이면 절 제목이나 본문 어딘가가 맞는 절만 보여준다
+                    let sec_hit = hit(sec.title)
+                        || sec.blocks.iter().any(|b| match b {
+                            Text(t) | Code(t) => hit(t),
+                            Bullets(items) | Steps(items) => items.iter().any(|it| hit(it)),
+                        });
+                    if !sec_hit {
+                        continue;
+                    }
+                    shown += 1;
+                    let heading = ui.heading(format!("{}. {}", i + 1, sec.title));
+                    if self.help_jump == Some(i) {
+                        heading.scroll_to_me(Some(egui::Align::TOP));
+                        self.help_jump = None;
+                    }
+                    ui.add_space(6.0);
+                    for block in sec.blocks {
+                        match block {
+                            Text(t) => {
+                                if hit(t) || hit(sec.title) {
+                                    ui.label(*t);
+                                }
+                            }
+                            Bullets(items) => {
+                                for it in items.iter().filter(|it| hit(it) || hit(sec.title)) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("•");
+                                        ui.label(*it);
+                                    });
+                                }
+                            }
+                            Steps(items) => {
+                                for (n, it) in items.iter().enumerate().filter(|(_, it)| hit(it) || hit(sec.title)) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(format!("{}.", n + 1)).strong());
+                                        ui.label(*it);
+                                    });
+                                }
+                            }
+                            Code(c) => {
+                                if hit(c) || hit(sec.title) {
+                                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                                        ui.label(egui::RichText::new(*c).monospace());
+                                    });
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
+                    ui.add_space(16.0);
+                }
+                if shown == 0 {
+                    ui.label(egui::RichText::new(format!("'{}' 에 맞는 내용이 없습니다", self.help_query)).color(egui::Color32::GRAY));
+                }
+            });
+        });
+    }
+
+    fn about_view(&mut self, ui: &mut egui::Ui) {
+        self.back_bar(ui, "URL Downloader 정보");
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.heading(egui::RichText::new("URL Downloader").size(26.0));
+            ui.label(format!("버전 {VERSION}"));
+            ui.add_space(6.0);
+            let state = self.update.lock().unwrap().clone();
+            match state {
+                UpdateState::Checking => {
+                    ui.label(egui::RichText::new("업데이트 확인 중…").color(egui::Color32::GRAY));
+                }
+                UpdateState::UpToDate => {
+                    ui.label(egui::RichText::new("최신 버전입니다").color(egui::Color32::LIGHT_GREEN));
+                }
+                UpdateState::Available { version, .. } => {
+                    ui.label(egui::RichText::new(format!("새 버전 v{version} 이 있습니다. 상단 오른쪽 버튼으로 업데이트하세요.")).color(egui::Color32::LIGHT_BLUE));
+                }
+                UpdateState::Error(e) => {
+                    ui.label(egui::RichText::new(format!("업데이트 확인 실패: {e}")).color(egui::Color32::GRAY).small());
+                }
+                UpdateState::Downloading { .. } | UpdateState::Installing => {
+                    ui.label(egui::RichText::new("업데이트 진행 중…").color(egui::Color32::LIGHT_BLUE));
+                }
+            }
+            if ui.button("업데이트 확인").clicked() {
+                self.check_update();
+            }
+            ui.add_space(16.0);
+            ui.label("URL 목록을 붙여넣고 폴더만 고르면 한꺼번에 내려받는 프로그램.");
+            ui.label("분할 다운로드와 이어받기를 지원합니다.");
+            ui.add_space(12.0);
+            ui.hyperlink_to("GitHub: bluelang1/url-downloader", REPO_URL);
+            ui.hyperlink_to("버그 제보 · 기능 제안 (Issues)", format!("{REPO_URL}/issues"));
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("MIT License  ·  © 2026 bluelang1").color(egui::Color32::GRAY));
+            ui.label(
+                egui::RichText::new("Rust · egui/eframe · reqwest · rfd")
+                    .color(egui::Color32::GRAY)
+                    .small(),
+            );
+        });
     }
 
     fn is_running(&self) -> bool {
