@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const REPO: &str = "bluelang1/url-downloader";
+
 /// 분할 구간 하나의 최소 크기. 이보다 작은 파일은 분할하지 않는다
 const MIN_CHUNK: u64 = 1024 * 1024;
 const BUF: usize = 64 * 1024;
@@ -48,6 +50,18 @@ struct App {
     about_open: bool,
     /// 도움말에서 목차를 눌러 이동할 절 번호
     help_jump: Option<usize>,
+    update: Arc<Mutex<UpdateState>>,
+}
+
+/// 업데이트 확인·적용 진행 상태
+#[derive(Clone)]
+enum UpdateState {
+    Checking,
+    UpToDate,
+    Available { version: String, url: String },
+    Downloading { done: u64, total: Option<u64> },
+    Installing,
+    Error(String),
 }
 
 impl Default for App {
@@ -61,13 +75,50 @@ impl Default for App {
             help_open: false,
             about_open: false,
             help_jump: None,
+            update: Arc::new(Mutex::new(UpdateState::Checking)),
         }
     }
 }
 
 const REPO_URL: &str = "https://github.com/bluelang1/url-downloader";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> eframe::Result {
+    // 터미널용: --version, --self-update <zip-url> (업데이트 교체 로직을 GUI 없이 검증)
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--version") => {
+            println!("url_downloader {VERSION}");
+            return Ok(());
+        }
+        Some("--check-update") => {
+            match fetch_latest_release() {
+                Ok(Some((v, url))) => println!("available: v{v} {url}"),
+                Ok(None) => println!("up to date ({VERSION})"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        Some("--self-update") => {
+            let url = args.get(2).expect("--self-update <zip-url>");
+            match install_update(url, &|s| {
+                if let UpdateState::Installing = s {
+                    eprintln!("installing…");
+                }
+            }) {
+                Ok(p) => println!("updated: {}", p.display()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 580.0]),
         ..Default::default()
@@ -77,7 +128,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::default()))
+            let app = App::default();
+            app.check_update();
+            Ok(Box::new(app))
         }),
     )
 }
@@ -140,6 +193,9 @@ impl eframe::App for App {
                             ui.close_menu();
                         }
                     }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.update_bar(ui);
                 });
             });
         });
@@ -434,6 +490,18 @@ const HELP: &[Section] = &[
         ],
     },
     Section {
+        title: "업데이트",
+        blocks: &[
+            Bullets(&[
+                "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 상단 오른쪽에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다. 현재 버전은 그 옆에 항상 표시됩니다.",
+                "버튼을 누르면 새 버전을 받아 지금 실행 중인 .app 을 같은 자리에서 교체하고 자동으로 다시 시작합니다. 진행 중인 다운로드는 끊기므로 끝난 뒤에 누르세요.",
+                "[정보 → URL Downloader 정보] 창에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있습니다.",
+                "cargo run 처럼 .app 번들이 아닌 상태로 실행 중이면 업데이트 버튼은 동작하지 않습니다.",
+                "교체에 실패하면 기존 앱을 그대로 되돌리고 상단에 ⚠ 표시가 뜹니다. 마우스를 올리면 사유가 보입니다.",
+            ]),
+        ],
+    },
+    Section {
         title: "문제 해결",
         blocks: &[
             Bullets(&[
@@ -519,7 +587,24 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(6.0);
                     ui.heading("URL Downloader");
-                    ui.label(format!("버전 {}", env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("버전 {VERSION}"));
+                    ui.add_space(4.0);
+                    let state = self.update.lock().unwrap().clone();
+                    match state {
+                        UpdateState::UpToDate => {
+                            ui.label(egui::RichText::new("최신 버전입니다").color(egui::Color32::LIGHT_GREEN));
+                        }
+                        UpdateState::Available { version, .. } => {
+                            ui.label(egui::RichText::new(format!("새 버전 v{version} 이 있습니다 (상단 버튼으로 업데이트)")).color(egui::Color32::LIGHT_BLUE));
+                        }
+                        UpdateState::Error(e) => {
+                            ui.label(egui::RichText::new(format!("업데이트 확인 실패: {e}")).color(egui::Color32::GRAY).small());
+                        }
+                        _ => {}
+                    }
+                    if ui.button("업데이트 확인").clicked() {
+                        self.check_update();
+                    }
                     ui.add_space(8.0);
                     ui.label("URL 목록을 붙여넣고 폴더만 고르면 한꺼번에 내려받는 프로그램.");
                     ui.label("분할 다운로드와 이어받기를 지원합니다.");
@@ -592,6 +677,72 @@ impl App {
                 download(Arc::clone(&shared), idx, dir.clone(), segments);
             });
         }
+    }
+}
+
+impl App {
+    /// 메뉴 바 오른쪽: 버전 표시와 업데이트 버튼/진행 상태
+    fn update_bar(&mut self, ui: &mut egui::Ui) {
+        let state = self.update.lock().unwrap().clone();
+        ui.label(egui::RichText::new(format!("v{VERSION}")).color(egui::Color32::GRAY));
+        match state {
+            UpdateState::Available { version, url } => {
+                let btn = egui::Button::new(
+                    egui::RichText::new(format!("⬆ 업데이트 v{version}")).color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(40, 120, 200));
+                if ui.add(btn).on_hover_text("새 버전을 받아 설치하고 다시 시작합니다").clicked() {
+                    self.apply_update(url);
+                }
+            }
+            UpdateState::Downloading { done, total } => {
+                let text = match total {
+                    Some(t) if t > 0 => format!("업데이트 받는 중 {} / {}", fmt_bytes(done), fmt_bytes(t)),
+                    _ => format!("업데이트 받는 중 {}", fmt_bytes(done)),
+                };
+                ui.add(egui::ProgressBar::new(total.map(|t| done as f32 / t.max(1) as f32).unwrap_or(0.0)).desired_width(220.0).text(text));
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            UpdateState::Installing => {
+                ui.spinner();
+                ui.label("설치 중…");
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            UpdateState::Error(e) => {
+                ui.label(egui::RichText::new("⚠").color(egui::Color32::LIGHT_RED)).on_hover_text(e);
+            }
+            UpdateState::Checking | UpdateState::UpToDate => {}
+        }
+    }
+
+    /// GitHub 최신 릴리스를 조회해 현재 버전보다 새 것이면 Available 로 바꾼다
+    fn check_update(&self) {
+        let state = Arc::clone(&self.update);
+        *state.lock().unwrap() = UpdateState::Checking;
+        thread::spawn(move || {
+            let result = fetch_latest_release();
+            *state.lock().unwrap() = match result {
+                Ok(Some((version, url))) => UpdateState::Available { version, url },
+                Ok(None) => UpdateState::UpToDate,
+                Err(e) => UpdateState::Error(e),
+            };
+        });
+    }
+
+    /// 새 버전 zip 을 받아 현재 .app 번들을 교체하고 다시 시작한다
+    fn apply_update(&self, url: String) {
+        let state = Arc::clone(&self.update);
+        thread::spawn(move || {
+            let set = |s: UpdateState| *state.lock().unwrap() = s;
+            match install_update(&url, &set) {
+                Ok(bundle) => {
+                    let _ = std::process::Command::new("open").arg("-n").arg(&bundle).spawn();
+                    thread::sleep(Duration::from_millis(500));
+                    std::process::exit(0);
+                }
+                Err(e) => set(UpdateState::Error(format!("업데이트 실패: {e}"))),
+            }
+        });
     }
 }
 
@@ -860,6 +1011,121 @@ fn load_meta(path: &Path) -> Option<Meta> {
     }
 }
 
+/// (새 버전, zip 다운로드 URL). 현재 버전 이하이면 None
+fn fetch_latest_release() -> Result<Option<(String, String)>, String> {
+    let client = Client::builder()
+        .user_agent(format!("url-downloader/{VERSION}"))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(
+            std::env::var("URL_DOWNLOADER_UPDATE_API")
+                .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest")),
+        )
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|e| e.to_string())?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(None); // 아직 릴리스가 없음
+    }
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let body = resp.text().map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let tag = json["tag_name"].as_str().unwrap_or("");
+    let latest = tag.trim_start_matches('v').to_string();
+    if parse_version(&latest) <= parse_version(VERSION) {
+        return Ok(None);
+    }
+    let url = json["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["name"].as_str().is_some_and(|n| n.ends_with(".zip")))
+        .find_map(|a| a["browser_download_url"].as_str().map(str::to_string))
+        .ok_or_else(|| format!("v{latest} 릴리스에 zip 파일이 없습니다"))?;
+    Ok(Some((latest, url)))
+}
+
+fn parse_version(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split(['.', '-', '+']).map(|p| p.parse::<u64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// 실행 중인 바이너리가 들어 있는 .app 번들 경로
+fn current_bundle() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // <Bundle>.app/Contents/MacOS/<exe>
+    exe.ancestors()
+        .nth(3)
+        .filter(|p| p.extension().is_some_and(|e| e == "app"))
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "앱 번들(.app)로 실행 중일 때만 업데이트할 수 있습니다".to_string())
+}
+
+/// zip 을 받아 풀고 현재 번들을 새 번들로 바꾼다. 성공하면 새 번들 경로를 돌려준다
+fn install_update(url: &str, set: &dyn Fn(UpdateState)) -> Result<PathBuf, String> {
+    let bundle = current_bundle()?;
+    let work = std::env::temp_dir().join(format!("url-downloader-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let zip = work.join("update.zip");
+
+    set(UpdateState::Downloading { done: 0, total: None });
+    let client = Client::builder().user_agent(format!("url-downloader/{VERSION}")).build().map_err(|e| e.to_string())?;
+    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let total = resp.content_length();
+    let mut file = File::create(&zip).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; BUF];
+    let mut done = 0u64;
+    loop {
+        let n = resp.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        done += n as u64;
+        set(UpdateState::Downloading { done, total });
+    }
+    drop(file);
+
+    set(UpdateState::Installing);
+    let extracted = work.join("extracted");
+    run("ditto", &["-x", "-k", &zip.to_string_lossy(), &extracted.to_string_lossy()])?;
+    let new_app = std::fs::read_dir(&extracted)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .ok_or("zip 안에 .app 이 없습니다")?;
+
+    // 기존 번들을 옆으로 치우고 새 번들을 같은 자리에 복사한 뒤 치운 것을 지운다
+    let backup = bundle.with_extension("app.old");
+    let _ = std::fs::remove_dir_all(&backup);
+    std::fs::rename(&bundle, &backup).map_err(|e| format!("기존 앱을 옮기지 못했습니다: {e}"))?;
+    if let Err(e) = run("ditto", &[&new_app.to_string_lossy(), &bundle.to_string_lossy()]) {
+        let _ = std::fs::rename(&backup, &bundle); // 실패하면 원복
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&backup);
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(bundle)
+}
+
+fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new(cmd).args(args).output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{cmd} 실패: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 /// 입력 한 줄에서 뽑아낸 항목
 #[derive(Debug, PartialEq, Clone)]
 struct Entry {
@@ -1016,6 +1282,14 @@ mod tests {
         let d = std::env::temp_dir();
         assert_eq!(unique_name(&d, "a.jpg", &mut used), "a.jpg");
         assert_eq!(unique_name(&d, "a.jpg", &mut used), "a (1).jpg");
+    }
+
+    #[test]
+    fn version_compare() {
+        assert!(parse_version("0.3.0") > parse_version("0.2.1"));
+        assert!(parse_version("1.0.0") > parse_version("0.99.99"));
+        assert_eq!(parse_version("0.2.1"), parse_version("0.2.1"));
+        assert!(parse_version("0.2.1-beta") <= parse_version("0.2.1"));
     }
 
     #[test]

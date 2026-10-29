@@ -18,6 +18,8 @@ downloads and resuming interrupted transfers.
   "다시 받기" 또는 앱 재실행 후 같은 폴더에 다시 받을 때 이어서 받습니다.
 - **다시 받기**: 실패한 항목만, 또는 체크한 항목만 골라 다시 받을 수 있습니다.
 - **이름 충돌 처리**: 같은 이름이 있으면 `이름 (1).ext` 처럼 번호를 붙입니다.
+- **자동 업데이트**: 상단에 현재 버전이 표시되고, GitHub 릴리스에 새 버전이 있으면 업데이트 버튼이 나타납니다.
+  누르면 새 `.app` 을 받아 제자리에서 교체하고 다시 시작합니다.
 - **앱 안 도움말**: 메뉴 **도움말** 에 목차가 있는 상세 사용법(입력 형식·설정·이어받기·문제 해결)이 들어 있고, **정보** 에서 버전·라이선스·저장소 링크를 볼 수 있습니다.
 
 ## 설치
@@ -27,7 +29,7 @@ Rust 툴체인(`cargo`)이 필요합니다.
 ```sh
 git clone https://github.com/bluelang1/url-downloader.git
 cd url-downloader
-./bundle.sh        # release 빌드 → dist/URL Downloader.app → /Applications 에 설치
+./bundle.sh        # release 빌드 → dist/URL Downloader.app + zip → /Applications 에 설치 (INSTALL=0 이면 설치 생략)
 ```
 
 개발 중에는 `cargo run --release` 로 바로 띄울 수 있습니다.
@@ -59,6 +61,28 @@ cd url-downloader
 - 모든 구간이 끝나면 `.part` 를 최종 이름으로 바꾸고 `.meta` 를 지웁니다.
 - 실패하면 `.part` 와 `.meta` 를 남깁니다. 다시 받을 때 크기와 ETag 가 같으면 이어받고, 다르면 처음부터 받습니다.
 - Range 를 지원하지 않는 서버는 한 줄기로 받습니다(이어받기 불가).
+
+## 업데이트와 릴리스
+
+앱은 시작할 때 이 저장소의 최신 릴리스를 확인합니다.
+릴리스는 태그를 푸시하면 GitHub Actions 가 만듭니다.
+
+```sh
+# 1. Cargo.toml 의 version 을 올리고 커밋
+# 2. 같은 번호로 태그를 푸시
+git tag v0.3.0 && git push origin main v0.3.0
+```
+
+`release.yml` 이 macOS 에서 테스트·빌드 후 `URL-Downloader-v<버전>-macos-arm64.zip` 을 릴리스에 올리고,
+설치된 앱은 다음 실행 때 업데이트 버튼을 보여 줍니다. 태그와 `Cargo.toml` 버전이 다르면 워크플로가 실패합니다.
+
+터미널에서 확인할 때:
+
+```sh
+"/Applications/URL Downloader.app/Contents/MacOS/url_downloader" --version
+"/Applications/URL Downloader.app/Contents/MacOS/url_downloader" --check-update
+"/Applications/URL Downloader.app/Contents/MacOS/url_downloader" --self-update <zip-url>
+```
 
 ## 개발
 

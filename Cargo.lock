@@ -3794,12 +3794,13 @@ dependencies = [
 
 [[package]]
 name = "url_downloader"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "percent-encoding",
  "reqwest",
  "rfd",
+ "serde_json",
 ]
 
 [[package]]
