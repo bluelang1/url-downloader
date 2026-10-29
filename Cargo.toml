@@ -1,6 +1,6 @@
 [package]
 name = "url_downloader"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Paste URLs, pick a folder, download them all. Segmented and resumable downloads with a small egui GUI."
 license = "MIT"

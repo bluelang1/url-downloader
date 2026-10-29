@@ -139,7 +139,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "URL Downloader",
+        &format!("URL Downloader (v{VERSION})"),
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
@@ -218,9 +218,6 @@ impl eframe::App for App {
                         }
                     }
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.update_bar(ui);
-                });
             });
         });
         // 단축키: F1 도움말, Esc 로 다운로드 화면 복귀
@@ -244,12 +241,21 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("링크 목록 (한 줄에 하나)");
-            ui.label(
-                egui::RichText::new("형식: URL  또는  파일명<Tab>URL  /  파일명 | URL   (확장자는 원본 그대로)")
-                    .color(egui::Color32::GRAY)
-                    .small(),
-            );
+            ui.horizontal(|ui| {
+                ui.heading("URL Downloader");
+                ui.label(egui::RichText::new(format!("(v{VERSION})")).color(egui::Color32::GRAY).size(15.0));
+                ui.add_space(6.0);
+                self.update_bar(ui);
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("링크 목록 (한 줄에 하나)").strong());
+                ui.label(
+                    egui::RichText::new("형식: URL  또는  파일명<Tab>URL  /  파일명 | URL   (확장자는 원본 그대로)")
+                        .color(egui::Color32::GRAY)
+                        .small(),
+                );
+            });
             ui.add_space(4.0);
 
             let mono = egui::TextStyle::Monospace;
@@ -541,7 +547,7 @@ const HELP: &[Section] = &[
         title: "업데이트",
         blocks: &[
             Bullets(&[
-                "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 상단 오른쪽에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다. 현재 버전은 그 옆에 항상 표시됩니다.",
+                "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 제목 'URL Downloader (v현재버전)' 옆에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다.",
                 "버튼을 누르면 새 버전을 받아 지금 실행 중인 .app 을 같은 자리에서 교체하고 자동으로 다시 시작합니다. 진행 중인 다운로드는 끊기므로 끝난 뒤에 누르세요.",
                 "[정보 → URL Downloader 정보] 화면에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있습니다.",
                 "cargo run 처럼 .app 번들이 아닌 상태로 실행 중이면 업데이트 버튼은 동작하지 않습니다.",
@@ -708,7 +714,7 @@ impl App {
                     ui.label(egui::RichText::new("최신 버전입니다").color(egui::Color32::LIGHT_GREEN));
                 }
                 UpdateState::Available { version, .. } => {
-                    ui.label(egui::RichText::new(format!("새 버전 v{version} 이 있습니다. 상단 오른쪽 버튼으로 업데이트하세요.")).color(egui::Color32::LIGHT_BLUE));
+                    ui.label(egui::RichText::new(format!("새 버전 v{version} 이 있습니다. 다운로드 화면 제목 옆 버튼으로 업데이트하세요.")).color(egui::Color32::LIGHT_BLUE));
                 }
                 UpdateState::Error(e) => {
                     ui.label(egui::RichText::new(format!("업데이트 확인 실패: {e}")).color(egui::Color32::GRAY).small());
@@ -794,10 +800,9 @@ impl App {
 }
 
 impl App {
-    /// 메뉴 바 오른쪽: 버전 표시와 업데이트 버튼/진행 상태
+    /// 타이틀 옆: 업데이트 버튼/진행 상태 (새 버전이 없으면 아무것도 안 그림)
     fn update_bar(&mut self, ui: &mut egui::Ui) {
         let state = self.update.lock().unwrap().clone();
-        ui.label(egui::RichText::new(format!("v{VERSION}")).color(egui::Color32::GRAY));
         match state {
             UpdateState::Available { version, url } => {
                 let btn = egui::Button::new(
