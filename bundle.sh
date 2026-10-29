@@ -5,9 +5,22 @@ cd "$(dirname "$0")"
 NAME="URL Downloader"
 APP="dist/$NAME.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-cargo build --release
+# UNIVERSAL=1 이면 arm64 + x86_64 를 lipo 로 합친다 (CI). 아니면 호스트 아키텍처만.
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+  cargo build --release --target aarch64-apple-darwin --target x86_64-apple-darwin
+  mkdir -p target/universal
+  lipo -create -output target/universal/url_downloader \
+    target/aarch64-apple-darwin/release/url_downloader \
+    target/x86_64-apple-darwin/release/url_downloader
+  BIN=target/universal/url_downloader
+  ARCH=universal
+else
+  cargo build --release
+  BIN=target/release/url_downloader
+  ARCH=$(uname -m)
+fi
 rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/url_downloader "$APP/Contents/MacOS/url_downloader"
+cp "$BIN" "$APP/Contents/MacOS/url_downloader"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -27,7 +40,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 codesign --force --deep --sign - "$APP"
 # 릴리스용 zip (업데이트 기능이 이 파일을 받는다)
-ZIP="dist/URL-Downloader-v$VERSION-macos-$(uname -m).zip"
+ZIP="dist/URL-Downloader-v$VERSION-macos-$ARCH.zip"
 ditto -c -k --keepParent "$APP" "$ZIP"
 echo "built: $APP, $ZIP"
 if [ "${INSTALL:-1}" = "1" ]; then

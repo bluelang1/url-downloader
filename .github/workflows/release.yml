@@ -10,12 +10,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - name: Check tag matches Cargo.toml version
         run: |
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ "v$V" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml v$V"; exit 1; }
       - run: cargo test
-      - run: INSTALL=0 ./bundle.sh
+      - run: UNIVERSAL=1 INSTALL=0 ./bundle.sh
       - name: Create GitHub release with .app zip
         env:
           GH_TOKEN: ${{ github.token }}

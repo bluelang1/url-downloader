@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,7 +26,18 @@ enum Status {
     Downloading { done: u64, total: Option<u64>, parts: usize },
     Finished,
     Failed(String),
+    /// 사용자가 멈춤. .part/.meta 가 남아 있어 이어받기 가능
+    Paused { done: u64, total: Option<u64> },
+    /// 사용자가 취소. 받던 파일은 지움
+    Cancelled,
 }
+
+/// 다운로드 스레드에 보내는 신호
+const STOP_NONE: u8 = 0;
+const STOP_PAUSE: u8 = 1;
+const STOP_CANCEL: u8 = 2;
+/// 멈춤 신호로 끝났음을 나타내는 오류 문자열
+const STOPPED: &str = "\u{0}stopped";
 
 struct Item {
     line: usize,
@@ -34,6 +45,26 @@ struct Item {
     name: String,
     status: Status,
     selected: bool,
+    stop: Arc<AtomicU8>,
+    /// 바이트/초 (지수 이동 평균)
+    speed: f32,
+    /// 속도 계산용 마지막 표본 (시각, 받은 바이트)
+    sample: Option<(Instant, u64)>,
+}
+
+impl Item {
+    fn new(line: usize, url: String, name: String) -> Self {
+        Self {
+            line,
+            url,
+            name,
+            status: Status::Waiting,
+            selected: false,
+            stop: Arc::new(AtomicU8::new(STOP_NONE)),
+            speed: 0.0,
+            sample: None,
+        }
+    }
 }
 
 type Shared = Arc<Mutex<Vec<Item>>>;
@@ -53,6 +84,12 @@ struct App {
     update: Arc<Mutex<UpdateState>>,
     /// 개발용: 몇 프레임 그린 뒤 화면을 파일로 저장하고 종료 (URL_DOWNLOADER_SCREENSHOT=경로.ppm)
     screenshot: Option<(PathBuf, u32)>,
+    /// 직전 프레임에 다운로드가 돌고 있었는지 (완료 알림용)
+    was_running: bool,
+    last_update_check: Instant,
+    /// 마지막으로 저장한 설정 (바뀌었을 때만 다시 저장)
+    saved_config: String,
+    autostart: bool,
 }
 
 /// 메인 영역에 보여줄 화면
@@ -86,6 +123,10 @@ impl Default for App {
             help_jump: None,
             help_query: String::new(),
             screenshot: std::env::var("URL_DOWNLOADER_SCREENSHOT").ok().map(|p| (PathBuf::from(p), 0)),
+            was_running: false,
+            last_update_check: Instant::now(),
+            saved_config: String::new(),
+            autostart: false,
             update: Arc::new(Mutex::new(UpdateState::Checking)),
         }
     }
@@ -144,6 +185,12 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
             let mut app = App::default();
+            app.load_config();
+            // 개발용: 입력 미리 채우기 / 첫 프레임에 자동 시작 (화면 검증)
+            if let Ok(text) = std::env::var("URL_DOWNLOADER_INPUT") {
+                app.input = text.replace("\\n", "\n").replace("\\t", "\t");
+            }
+            app.autostart = std::env::var("URL_DOWNLOADER_AUTOSTART").is_ok();
             app.view = match std::env::var("URL_DOWNLOADER_START_VIEW").as_deref() {
                 Ok("help") => View::Help,
                 Ok("about") => View::About,
@@ -186,6 +233,20 @@ impl eframe::App for App {
         let running = self.is_running();
         if running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else {
+            // 매시간 업데이트 재확인이 멈춰 있지 않도록 가끔 깨운다
+            ctx.request_repaint_after(Duration::from_secs(60));
+        }
+        self.notify_if_finished(running);
+        self.was_running = running;
+        self.hourly_update_check();
+        self.accept_dropped_files(ctx);
+        self.save_config_if_changed();
+        if std::mem::take(&mut self.autostart) {
+            if let Some(dir) = self.folder.clone() {
+                let urls = parse_urls(&self.input);
+                self.start(urls, dir);
+            }
         }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -295,10 +356,12 @@ impl eframe::App for App {
                     egui::Button::new(format!("다운로드 ({}개)", urls.len())),
                 );
                 if btn.clicked() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("저장할 폴더 선택")
-                        .pick_folder()
-                    {
+                    // 기억해 둔 폴더가 있으면 바로 시작, 없으면 고른다
+                    let dir = match self.folder.clone().filter(|d| d.is_dir()) {
+                        Some(d) => Some(d),
+                        None => pick_folder(),
+                    };
+                    if let Some(dir) = dir {
                         self.folder = Some(dir.clone());
                         self.start(urls, dir);
                     }
@@ -315,32 +378,64 @@ impl eframe::App for App {
                 ui.add_enabled(!running, egui::DragValue::new(&mut self.segments).range(1..=16))
                     .on_hover_text("파일 하나를 몇 개 연결로 나눠 받을지\n(서버가 Range 를 지원하고 1MB 이상일 때만 적용)");
             });
-            if let Some(dir) = self.folder.clone() {
-                ui.horizontal(|ui| {
-                    if ui.button("폴더 열기").clicked() {
-                        let _ = std::process::Command::new("open").arg(&dir).spawn();
+            ui.horizontal(|ui| {
+                ui.label("저장 폴더:");
+                match self.folder.clone() {
+                    Some(dir) => {
+                        ui.label(egui::RichText::new(shorten(&dir.display().to_string(), 48)).color(egui::Color32::GRAY))
+                            .on_hover_text(format!("{}\n다음 다운로드도 이 폴더에 저장합니다", dir.display()));
+                        if ui.add_enabled(!running, egui::Button::new("변경…")).clicked() {
+                            if let Some(d) = pick_folder() {
+                                self.folder = Some(d);
+                            }
+                        }
+                        if ui.button("열기").clicked() {
+                            let _ = std::process::Command::new("open").arg(&dir).spawn();
+                        }
                     }
-                    ui.label(egui::RichText::new(dir.display().to_string()).color(egui::Color32::GRAY));
-                });
-            }
+                    None => {
+                        ui.label(egui::RichText::new("(다운로드를 누르면 고릅니다)").color(egui::Color32::GRAY));
+                        if ui.button("선택…").clicked() {
+                            if let Some(d) = pick_folder() {
+                                self.folder = Some(d);
+                            }
+                        }
+                    }
+                }
+            });
 
             ui.add_space(8.0);
             ui.separator();
 
             let mut retry = false;
+            let mut resume: Vec<usize> = Vec::new();
             {
                 let mut items = self.items.lock().unwrap();
                 let total = items.len();
-                let finished = items.iter().filter(|i| matches!(i.status, Status::Finished)).count();
-                let failed = items.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
+                let count = |f: &dyn Fn(&Status) -> bool| items.iter().filter(|i| f(&i.status)).count();
+                let finished = count(&|s| matches!(s, Status::Finished));
+                let failed = count(&|s| matches!(s, Status::Failed(_)));
+                let paused = count(&|s| matches!(s, Status::Paused { .. }));
+                let cancelled = count(&|s| matches!(s, Status::Cancelled));
                 let selected = items.iter().filter(|i| i.selected).count();
                 if total > 0 {
                     let (text, color) = if running {
                         (format!("진행 중  {} / {}", finished + failed, total), egui::Color32::LIGHT_BLUE)
-                    } else if failed == 0 {
+                    } else if finished == total {
                         (format!("✅ 완료  {} / {}", finished, total), egui::Color32::LIGHT_GREEN)
                     } else {
-                        (format!("⚠ 완료 {}개, 실패 {}개", finished, failed), egui::Color32::LIGHT_RED)
+                        let mut parts = vec![format!("완료 {finished}")];
+                        if failed > 0 {
+                            parts.push(format!("실패 {failed}"));
+                        }
+                        if paused > 0 {
+                            parts.push(format!("일시정지 {paused}"));
+                        }
+                        if cancelled > 0 {
+                            parts.push(format!("취소 {cancelled}"));
+                        }
+                        let color = if failed > 0 { egui::Color32::LIGHT_RED } else { egui::Color32::LIGHT_YELLOW };
+                        (format!("⚠ {}  (전체 {total})", parts.join(" · ")), color)
                     };
                     ui.horizontal(|ui| {
                         let mut all = selected == total;
@@ -351,20 +446,33 @@ impl eframe::App for App {
                         }
                         ui.colored_label(color, egui::RichText::new(text).strong().size(16.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_enabled(!running && selected > 0, egui::Button::new(format!("선택한 것만 다시 받기 ({selected}개)")))
-                                .clicked()
-                            {
-                                retry = true;
-                            }
-                            if ui
-                                .add_enabled(!running && failed > 0, egui::Button::new(format!("실패한 것만 다시 받기 ({failed}개)")))
-                                .clicked()
-                            {
-                                for i in items.iter_mut() {
-                                    i.selected = matches!(i.status, Status::Failed(_));
+                            if running {
+                                if ui.button("모두 취소").on_hover_text("받던 파일을 지우고 멈춥니다").clicked() {
+                                    for i in items.iter_mut() {
+                                        i.stop.store(STOP_CANCEL, Relaxed);
+                                    }
                                 }
-                                retry = true;
+                                if ui.button("모두 일시정지").on_hover_text("받은 만큼 남겨 두고 멈춥니다").clicked() {
+                                    for i in items.iter_mut() {
+                                        i.stop.store(STOP_PAUSE, Relaxed);
+                                    }
+                                }
+                            } else {
+                                if ui
+                                    .add_enabled(selected > 0, egui::Button::new(format!("선택한 것만 다시 받기 ({selected}개)")))
+                                    .clicked()
+                                {
+                                    retry = true;
+                                }
+                                if ui
+                                    .add_enabled(failed + paused > 0, egui::Button::new(format!("실패·일시정지 다시 받기 ({}개)", failed + paused)))
+                                    .clicked()
+                                {
+                                    for i in items.iter_mut() {
+                                        i.selected = matches!(i.status, Status::Failed(_) | Status::Paused { .. });
+                                    }
+                                    retry = true;
+                                }
                             }
                         });
                     });
@@ -375,14 +483,18 @@ impl eframe::App for App {
                 self.retry_selected();
             }
 
+            let folder = self.folder.clone();
             let mut items = self.items.lock().unwrap();
             egui::ScrollArea::vertical().id_salt("list").show(ui, |ui| {
-                for item in items.iter_mut() {
+                for (idx, item) in items.iter_mut().enumerate() {
+                    update_speed(item);
                     let (mark, color) = match &item.status {
                         Status::Waiting => ("⏳", egui::Color32::GRAY),
                         Status::Downloading { .. } => ("⬇", egui::Color32::LIGHT_BLUE),
                         Status::Finished => ("✅", egui::Color32::LIGHT_GREEN),
                         Status::Failed(_) => ("❌", egui::Color32::LIGHT_RED),
+                        Status::Paused { .. } => ("⏸", egui::Color32::LIGHT_YELLOW),
+                        Status::Cancelled => ("✖", egui::Color32::DARK_GRAY),
                     };
                     ui.horizontal(|ui| {
                         ui.set_width(ui.available_width());
@@ -393,25 +505,63 @@ impl eframe::App for App {
                                 .strong(),
                         );
                         ui.colored_label(color, mark);
-                        ui.label(egui::RichText::new(&item.name).strong());
+                        if matches!(item.status, Status::Finished) {
+                            // 완료된 파일은 눌러서 Finder 에서 보여준다
+                            if ui.link(egui::RichText::new(&item.name).strong()).on_hover_text("Finder 에서 보기").clicked() {
+                                if let Some(dir) = &folder {
+                                    let _ = std::process::Command::new("open").arg("-R").arg(dir.join(&item.name)).spawn();
+                                }
+                            }
+                        } else {
+                            ui.label(egui::RichText::new(&item.name).strong());
+                        }
                         ui.label(
-                            egui::RichText::new(shorten(&item.url, 60))
+                            egui::RichText::new(shorten(&item.url, 50))
                                 .color(egui::Color32::GRAY)
                                 .small(),
                         )
                         .on_hover_text(&item.url);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match item.status {
+                                Status::Waiting | Status::Downloading { .. } => {
+                                    if ui.small_button("취소").on_hover_text("받던 파일을 지우고 멈춥니다").clicked() {
+                                        item.stop.store(STOP_CANCEL, Relaxed);
+                                    }
+                                    if ui.small_button("일시정지").on_hover_text("받은 만큼 남겨 두고 멈춥니다 (나중에 이어받기)").clicked() {
+                                        item.stop.store(STOP_PAUSE, Relaxed);
+                                    }
+                                }
+                                Status::Paused { .. } => {
+                                    if ui.small_button("이어받기").on_hover_text("받은 곳부터 이어서 받습니다").clicked() {
+                                        resume.push(idx);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.add_space(54.0);
                         match &item.status {
                             Status::Downloading { done, total, parts } => {
-                                let suffix = if *parts > 1 { format!("  ·  {parts}분할") } else { String::new() };
+                                let mut info = String::new();
+                                if item.speed > 1.0 {
+                                    info += &format!("  ·  {}/s", fmt_bytes(item.speed as u64));
+                                    if let Some(t) = total {
+                                        if *t > *done {
+                                            info += &format!("  ·  남은 {}", fmt_secs(((*t - *done) as f32 / item.speed) as u64));
+                                        }
+                                    }
+                                }
+                                if *parts > 1 {
+                                    info += &format!("  ·  {parts}분할");
+                                }
                                 let bar = match total {
                                     Some(t) if *t > 0 => egui::ProgressBar::new(*done as f32 / *t as f32)
-                                        .text(format!("{} / {}{suffix}", fmt_bytes(*done), fmt_bytes(*t))),
+                                        .text(format!("{} / {}{info}", fmt_bytes(*done), fmt_bytes(*t))),
                                     _ => egui::ProgressBar::new(0.0)
                                         .animate(true)
-                                        .text(fmt_bytes(*done)),
+                                        .text(format!("{}{info}", fmt_bytes(*done))),
                                 };
                                 ui.add(bar);
                             }
@@ -421,6 +571,16 @@ impl eframe::App for App {
                             Status::Failed(e) => {
                                 ui.colored_label(egui::Color32::LIGHT_RED, e);
                             }
+                            Status::Paused { done, total } => {
+                                let (frac, text) = match total {
+                                    Some(t) if *t > 0 => (*done as f32 / *t as f32, format!("일시정지  {} / {}", fmt_bytes(*done), fmt_bytes(*t))),
+                                    _ => (0.0, format!("일시정지  {}", fmt_bytes(*done))),
+                                };
+                                ui.add(egui::ProgressBar::new(frac).fill(egui::Color32::from_rgb(160, 140, 40)).text(text));
+                            }
+                            Status::Cancelled => {
+                                ui.label(egui::RichText::new("취소됨").color(egui::Color32::DARK_GRAY));
+                            }
                             Status::Waiting => {
                                 ui.add(egui::ProgressBar::new(0.0).text("대기"));
                             }
@@ -429,7 +589,65 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                 }
             });
+            drop(items);
+            if !resume.is_empty() {
+                if let Some(dir) = self.folder.clone() {
+                    self.spawn_workers(resume, dir);
+                }
+            }
+            self.drop_overlay(ctx);
         });
+    }
+}
+
+/// ~/Library/Application Support/URL Downloader/config.json
+fn config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/URL Downloader/config.json"))
+}
+
+/// macOS 알림 센터에 띄운다 (osascript)
+fn notify(title: &str, msg: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        msg.replace('"', "'"),
+        title.replace('"', "'")
+    );
+    let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+}
+
+fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title("저장할 폴더 선택").pick_folder()
+}
+
+/// 0.5초마다 표본을 찍어 속도를 지수 이동 평균으로 갱신한다
+fn update_speed(item: &mut Item) {
+    let Status::Downloading { done, .. } = item.status else {
+        item.sample = None;
+        item.speed = 0.0;
+        return;
+    };
+    let now = Instant::now();
+    match item.sample {
+        None => item.sample = Some((now, done)),
+        Some((t, d)) => {
+            let dt = now.duration_since(t).as_secs_f32();
+            if dt >= 0.5 {
+                let inst = done.saturating_sub(d) as f32 / dt;
+                item.speed = if item.speed <= 0.0 { inst } else { item.speed * 0.7 + inst * 0.3 };
+                item.sample = Some((now, done));
+            }
+        }
+    }
+}
+
+fn fmt_secs(s: u64) -> String {
+    if s >= 3600 {
+        format!("{}시간 {}분", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}분 {}초", s / 60, s % 60)
+    } else {
+        format!("{s}초")
     }
 }
 
@@ -480,6 +698,7 @@ const HELP: &[Section] = &[
                 "스프레드시트에서 '파일명, URL' 두 열을 복사해 붙이면 탭으로 구분돼 그대로 동작합니다.",
                 "파일명에 쓸 수 없는 문자  / \\ : * ? \" < > |  는 밑줄(_)로 바뀝니다.",
                 "빈 줄이나 URL 이 없는 줄은 건너뜁니다. 왼쪽 줄 번호가 목록의 번호와 같아서 어느 줄인지 찾기 쉽습니다.",
+                "URL 목록이 든 텍스트 파일(.txt, .csv 등)을 창에 끌어다 놓으면 내용이 입력창 끝에 추가됩니다.",
             ]),
         ],
     },
@@ -491,6 +710,8 @@ const HELP: &[Section] = &[
                 "파일당 분할 (기본 4): 파일 하나를 몇 개 연결로 나눠 받을지입니다. 서버가 Range 요청을 지원하고 파일이 1 MB 이상일 때만 적용됩니다.",
                 "실제로 열리는 연결 수는 두 값의 곱입니다(기본 3 × 4 = 12). 서버가 연결 수를 제한하거나 속도가 오히려 떨어지면 분할 수를 1~2 로 낮추세요.",
                 "두 값은 다운로드가 진행 중일 때는 바꿀 수 없습니다. 다시 받기에도 현재 값이 적용됩니다.",
+                "저장 폴더: 한 번 고르면 기억해 두고 다음부터는 [다운로드] 를 누르면 바로 그 폴더에 받습니다. 바꾸려면 [변경…] 을 누르세요.",
+                "동시 파일·분할 수·저장 폴더는 앱을 껐다 켜도 유지됩니다 (~/Library/Application Support/URL Downloader/config.json).",
             ]),
         ],
     },
@@ -499,18 +720,23 @@ const HELP: &[Section] = &[
         blocks: &[
             Bullets(&[
                 "⏳ 대기: 차례를 기다리는 중",
-                "⬇ 진행: 받는 중. 진행바에 받은 크기 / 전체 크기가 표시되고, 분할 중이면 'N분할' 이 함께 보입니다.",
-                "✅ 완료: 최종 파일명으로 저장됨",
+                "⬇ 진행: 받는 중. 진행바에 받은 크기 / 전체 크기, 현재 속도(MB/s), 남은 시간, 분할 중이면 'N분할' 이 표시됩니다. 속도는 0.5초마다 재고 평균을 내므로 처음 1초 정도는 비어 있습니다.",
+                "✅ 완료: 최종 파일명으로 저장됨. 파일명을 누르면 Finder 에서 그 파일을 보여줍니다.",
                 "❌ 실패: 사유가 빨간 글씨로 표시되고 체크박스가 자동으로 켜집니다.",
+                "⏸ 일시정지: 사용자가 멈춘 상태. 받은 만큼 남아 있어 [이어받기] 로 이어받을 수 있습니다.",
+                "✖ 취소됨: 사용자가 취소해 받던 파일을 지운 상태. 체크해서 [선택한 것만 다시 받기] 로 처음부터 다시 받을 수 있습니다.",
             ]),
-            Text("목록 위의 요약 줄에는 전체 / 완료 / 실패 개수가 표시됩니다. 전체 크기를 알려주지 않는 서버는 진행바 대신 받은 크기만 움직입니다."),
+            Text("목록 위의 요약 줄에는 전체 / 완료 / 실패 / 일시정지 / 취소 개수가 표시됩니다. 전체 크기를 알려주지 않는 서버는 진행바 대신 받은 크기만 움직입니다."),
+            Text("모든 항목이 끝나면 macOS 알림이 뜹니다 (완료·실패 개수). 직접 일시정지·취소한 경우는 알리지 않습니다."),
         ],
     },
     Section {
-        title: "다시 받기",
+        title: "일시정지 · 취소 · 다시 받기",
         blocks: &[
             Bullets(&[
-                "[실패한 것만 다시 받기]: 실패 항목을 모두 골라 다시 받습니다.",
+                "각 항목 오른쪽의 [일시정지] 는 그 파일만 멈추고, [취소] 는 받던 파일을 지우고 멈춥니다. 요약 줄의 [모두 일시정지] / [모두 취소] 는 진행 중인 전부에 적용됩니다.",
+                "일시정지는 받은 만큼을 .part/.meta 로 남겨 두므로 [이어받기] 를 누르거나 [실패·일시정지 다시 받기] 로 받은 곳부터 이어집니다. 취소는 받던 파일을 지웁니다.",
+                "[실패·일시정지 다시 받기]: 실패했거나 일시정지된 항목을 모두 골라 다시 받습니다.",
                 "[선택한 것만 다시 받기]: 체크박스를 켠 항목만 다시 받습니다. 맨 위 체크박스로 전체 선택/해제할 수 있습니다.",
                 "다시 받기는 처음 고른 폴더에 저장합니다. 이어받기 기록이 있으면 받은 곳부터 이어서 받습니다(다음 절 참고).",
                 "[지우기] 는 입력창과 목록을 비웁니다. 이미 받은 파일은 지우지 않습니다.",
@@ -549,7 +775,7 @@ const HELP: &[Section] = &[
             Bullets(&[
                 "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 제목 'URL Downloader (v현재버전)' 옆에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다.",
                 "버튼을 누르면 새 버전을 받아 지금 실행 중인 .app 을 같은 자리에서 교체하고 자동으로 다시 시작합니다. 진행 중인 다운로드는 끊기므로 끝난 뒤에 누르세요.",
-                "[정보 → URL Downloader 정보] 화면에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있습니다.",
+                "[정보 → URL Downloader 정보] 화면에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있고, 켜 둔 채로 두면 1시간마다 자동으로 다시 확인합니다.",
                 "cargo run 처럼 .app 번들이 아닌 상태로 실행 중이면 업데이트 버튼은 동작하지 않습니다.",
                 "교체에 실패하면 기존 앱을 그대로 되돌리고 상단에 ⚠ 표시가 뜹니다. 마우스를 올리면 사유가 보입니다.",
             ]),
@@ -571,11 +797,116 @@ const HELP: &[Section] = &[
 ];
 
 impl App {
+    fn notify_if_finished(&self, running: bool) {
+        if !(self.was_running && !running) {
+            return;
+        }
+        let items = self.items.lock().unwrap();
+        let total = items.len();
+        let finished = items.iter().filter(|i| matches!(i.status, Status::Finished)).count();
+        let failed = items.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
+        // 사용자가 직접 멈춘 경우(일시정지·취소만 남음)는 알리지 않는다
+        if total == 0 || finished + failed < total {
+            return;
+        }
+        let msg = if failed == 0 {
+            format!("{finished}개 파일 다운로드 완료")
+        } else {
+            format!("완료 {finished}개, 실패 {failed}개")
+        };
+        notify("URL Downloader", &msg);
+    }
+
+    fn hourly_update_check(&mut self) {
+        if self.last_update_check.elapsed() < Duration::from_secs(3600) {
+            return;
+        }
+        let busy = matches!(*self.update.lock().unwrap(), UpdateState::Downloading { .. } | UpdateState::Installing);
+        if !busy {
+            self.check_update();
+        }
+        self.last_update_check = Instant::now();
+    }
+
+    /// 창에 떨어뜨린 텍스트 파일(.txt/.csv 등)의 내용을 입력창에 덧붙인다
+    fn accept_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for path in dropped {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if !self.input.is_empty() && !self.input.ends_with('\n') {
+                self.input.push('\n');
+            }
+            self.input.push_str(text.trim_end());
+            self.input.push('\n');
+            self.view = View::Download;
+        }
+    }
+
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        if !ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        egui::Area::new(egui::Id::new("drop_overlay"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_premultiplied(30, 90, 160, 230))
+                    .inner_margin(24.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("📄 여기에 놓으면 파일의 URL 목록을 입력창에 추가합니다").size(18.0).color(egui::Color32::WHITE));
+                    });
+            });
+    }
+
+    fn config_json(&self) -> String {
+        serde_json::json!({
+            "folder": self.folder.as_ref().map(|p| p.display().to_string()),
+            "concurrent": self.concurrent,
+            "segments": self.segments,
+        })
+        .to_string()
+    }
+
+    fn load_config(&mut self) {
+        let Some(path) = config_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+        if let Some(f) = v["folder"].as_str() {
+            let p = PathBuf::from(f);
+            if p.is_dir() {
+                self.folder = Some(p);
+            }
+        }
+        if let Some(n) = v["concurrent"].as_u64() {
+            self.concurrent = (n as usize).clamp(1, 16);
+        }
+        if let Some(n) = v["segments"].as_u64() {
+            self.segments = (n as usize).clamp(1, 16);
+        }
+        self.saved_config = self.config_json();
+    }
+
+    fn save_config_if_changed(&mut self) {
+        let now = self.config_json();
+        if now == self.saved_config {
+            return;
+        }
+        if let Some(path) = config_path() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, &now);
+        }
+        self.saved_config = now;
+    }
+
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
         let Some((path, frames)) = self.screenshot.as_mut() else { return };
         *frames += 1;
         ctx.request_repaint();
-        if *frames == 5 {
+        let at: u32 = std::env::var("URL_DOWNLOADER_SCREENSHOT_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        if *frames == at {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
         let shot = ctx.input(|i| {
@@ -754,7 +1085,7 @@ impl App {
             .iter()
             .map(|e| {
                 let name = unique_name(&dir, &target_name(e), &mut names);
-                Item { line: e.line, url: e.url.clone(), name, status: Status::Waiting, selected: false }
+                Item::new(e.line, e.url.clone(), name)
             })
             .collect();
         *self.items.lock().unwrap() = items;
@@ -775,6 +1106,7 @@ impl App {
             for &i in &idxs {
                 items[i].status = Status::Waiting;
                 items[i].selected = false;
+                items[i].stop.store(STOP_NONE, Relaxed);
             }
             idxs
         };
@@ -783,6 +1115,13 @@ impl App {
 
     /// 작업 큐에서 하나씩 꺼내 받는 워커를 `concurrent` 개만 띄운다
     fn spawn_workers(&self, idxs: Vec<usize>, dir: PathBuf) {
+        {
+            let mut items = self.items.lock().unwrap();
+            for &i in &idxs {
+                items[i].status = Status::Waiting;
+                items[i].stop.store(STOP_NONE, Relaxed);
+            }
+        }
         let workers = self.concurrent.clamp(1, idxs.len().max(1));
         let queue = Arc::new(Mutex::new(VecDeque::from(idxs)));
         let segments = self.segments.max(1);
@@ -865,14 +1204,34 @@ impl App {
 }
 
 fn download(shared: Shared, idx: usize, dir: PathBuf, segments: usize) {
-    let (url, name) = {
+    let (url, name, stop) = {
         let items = shared.lock().unwrap();
-        (items[idx].url.clone(), items[idx].name.clone())
+        (items[idx].url.clone(), items[idx].name.clone(), Arc::clone(&items[idx].stop))
     };
     let set = |s: Status| shared.lock().unwrap()[idx].status = s;
+    let dest = dir.join(&name);
 
-    match download_file(&url, &dir.join(&name), segments, &set) {
+    // 큐에서 기다리는 동안 멈춤 신호가 왔으면 시작하지 않는다
+    let result = match stop.load(Relaxed) {
+        STOP_NONE => download_file(&url, &dest, segments, &stop, &set),
+        _ => Err(STOPPED.to_string()),
+    };
+    match result {
         Ok(()) => set(Status::Finished),
+        Err(e) if e == STOPPED => {
+            let mut items = shared.lock().unwrap();
+            let (done, total) = match items[idx].status {
+                Status::Downloading { done, total, .. } => (done, total),
+                _ => (0, None),
+            };
+            if stop.load(Relaxed) == STOP_CANCEL {
+                let _ = std::fs::remove_file(sidecar(&dest, "part"));
+                let _ = std::fs::remove_file(sidecar(&dest, "meta"));
+                items[idx].status = Status::Cancelled;
+            } else {
+                items[idx].status = Status::Paused { done, total };
+            }
+        }
         Err(e) => {
             let mut items = shared.lock().unwrap();
             items[idx].status = Status::Failed(e);
@@ -883,7 +1242,7 @@ fn download(shared: Shared, idx: usize, dir: PathBuf, segments: usize) {
 
 /// `dest` 옆에 `<dest>.part`(받는 중인 본문)와 `<dest>.meta`(구간별 진행 상황)를 두고 받는다.
 /// 서버가 Range 를 지원하면 분할·이어받기, 아니면 처음부터 한 줄기로 받는다.
-fn download_file(url: &str, dest: &Path, segments: usize, set: &(dyn Fn(Status) + Sync)) -> Result<(), String> {
+fn download_file(url: &str, dest: &Path, segments: usize, stop: &AtomicU8, set: &(dyn Fn(Status) + Sync)) -> Result<(), String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0")
         .build()
@@ -910,19 +1269,19 @@ fn download_file(url: &str, dest: &Path, segments: usize, set: &(dyn Fn(Status) 
         let etag = header(&probe, ETAG);
         drop(probe);
         match total {
-            Some(total) => download_ranged(&client, url, &part, &meta, total, &etag, segments, set)?,
+            Some(total) => download_ranged(&client, url, &part, &meta, total, &etag, segments, stop, set)?,
             None => {
                 // 206 인데 전체 크기를 안 알려주는 서버: 일반 GET 으로 받는다
                 let resp = client.get(url).send().map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
                     return Err(format!("HTTP {}", resp.status()));
                 }
-                stream_whole(resp, &part, set)?;
+                stream_whole(resp, &part, stop, set)?;
             }
         }
     } else {
         // Range 무시(200): 이 응답이 곧 전체 본문
-        stream_whole(probe, &part, set)?;
+        stream_whole(probe, &part, stop, set)?;
     }
     std::fs::rename(&part, dest).map_err(|e| e.to_string())
 }
@@ -941,7 +1300,7 @@ fn header(resp: &Response, key: HeaderName) -> String {
 }
 
 /// Range 미지원: 응답 본문을 처음부터 끝까지 한 줄기로 받는다 (이어받기 불가)
-fn stream_whole(mut resp: Response, part: &Path, set: &(dyn Fn(Status) + Sync)) -> Result<(), String> {
+fn stream_whole(mut resp: Response, part: &Path, stop: &AtomicU8, set: &(dyn Fn(Status) + Sync)) -> Result<(), String> {
     let total = resp.content_length();
     set(Status::Downloading { done: 0, total, parts: 1 });
     let mut file = File::create(part).map_err(|e| e.to_string())?;
@@ -955,6 +1314,9 @@ fn stream_whole(mut resp: Response, part: &Path, set: &(dyn Fn(Status) + Sync)) 
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         done += n as u64;
         set(Status::Downloading { done, total, parts: 1 });
+        if stop.load(Relaxed) != STOP_NONE {
+            return Err(STOPPED.to_string());
+        }
     }
     Ok(())
 }
@@ -981,6 +1343,7 @@ fn download_ranged(
     total: u64,
     etag: &str,
     segments: usize,
+    stop: &AtomicU8,
     set: &(dyn Fn(Status) + Sync),
 ) -> Result<(), String> {
     // 같은 파일(크기·ETag 일치)의 진행 기록이 남아 있으면 거기서부터 이어받는다
@@ -1031,15 +1394,17 @@ fn download_ranged(
     let errors: Vec<String> = thread::scope(|sc| {
         let handles: Vec<_> = segs
             .iter()
-            .map(|seg| sc.spawn(move || fetch_segment(client, url, file, seg, tick)))
+            .map(|seg| sc.spawn(move || fetch_segment(client, url, file, seg, stop, tick)))
             .collect();
         handles
             .into_iter()
             .filter_map(|h| h.join().unwrap_or_else(|_| Err("스레드 오류".into())).err())
             .collect()
     });
-    if let Some(e) = errors.into_iter().next() {
+    if !errors.is_empty() {
         let _ = save();
+        // 멈춤 신호가 원인이면 그걸 우선 보고한다 (다른 구간의 '연결 끊김' 보다)
+        let e = errors.iter().find(|e| *e == STOPPED).cloned().unwrap_or_else(|| errors[0].clone());
         return Err(e);
     }
     let _ = std::fs::remove_file(meta_path);
@@ -1047,25 +1412,29 @@ fn download_ranged(
 }
 
 /// 구간 하나를 받는다. 끊기면 받은 곳부터 다시 요청한다
-fn fetch_segment(client: &Client, url: &str, file: &File, seg: &Seg, tick: &(dyn Fn() + Sync)) -> Result<(), String> {
+fn fetch_segment(client: &Client, url: &str, file: &File, seg: &Seg, stop: &AtomicU8, tick: &(dyn Fn() + Sync)) -> Result<(), String> {
     let len = seg.end - seg.start;
     let mut last_err = String::new();
     for attempt in 0..RETRIES {
         if seg.done.load(Relaxed) >= len {
             return Ok(());
         }
+        if stop.load(Relaxed) != STOP_NONE {
+            return Err(STOPPED.to_string());
+        }
         if attempt > 0 {
             thread::sleep(Duration::from_secs(2));
         }
-        match fetch_once(client, url, file, seg, tick) {
+        match fetch_once(client, url, file, seg, stop, tick) {
             Ok(()) => return Ok(()),
+            Err(e) if e == STOPPED => return Err(e),
             Err(e) => last_err = e,
         }
     }
     Err(last_err)
 }
 
-fn fetch_once(client: &Client, url: &str, file: &File, seg: &Seg, tick: &(dyn Fn() + Sync)) -> Result<(), String> {
+fn fetch_once(client: &Client, url: &str, file: &File, seg: &Seg, stop: &AtomicU8, tick: &(dyn Fn() + Sync)) -> Result<(), String> {
     let len = seg.end - seg.start;
     let mut done = seg.done.load(Relaxed);
     let mut resp = client
@@ -1090,6 +1459,9 @@ fn fetch_once(client: &Client, url: &str, file: &File, seg: &Seg, tick: &(dyn Fn
         tick();
         if done >= len {
             break;
+        }
+        if stop.load(Relaxed) != STOP_NONE {
+            return Err(STOPPED.to_string());
         }
     }
     if done < len {
@@ -1286,14 +1658,22 @@ fn parse_line(line: &str) -> Option<(String, Option<String>)> {
 fn target_name(e: &Entry) -> String {
     let original = file_name_from_url(&e.url, e.line);
     match &e.name {
-        Some(n) => {
-            let ext = match original.rfind('.') {
-                Some(p) if p > 0 => &original[p..],
-                _ => "",
-            };
-            format!("{n}{ext}")
-        }
+        Some(n) => format!("{n}{}", extension_of(&original)),
         None => original,
+    }
+}
+
+/// ".tar.gz" 같은 복합 확장자를 포함한 확장자 (점 포함). 없으면 빈 문자열
+fn extension_of(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    for double in [".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tar.lz"] {
+        if lower.ends_with(double) && name.len() > double.len() {
+            return &name[name.len() - double.len()..];
+        }
+    }
+    match name.rfind('.') {
+        Some(p) if p > 0 => &name[p..],
+        _ => "",
     }
 }
 
@@ -1373,13 +1753,50 @@ mod tests {
     }
 
     fn item(url: &str, name: &str) -> Shared {
-        Arc::new(Mutex::new(vec![Item {
-            line: 1,
-            selected: false,
-            url: url.into(),
-            name: name.into(),
-            status: Status::Waiting,
-        }]))
+        Arc::new(Mutex::new(vec![Item::new(1, url.into(), name.into())]))
+    }
+
+    #[test]
+    fn pause_keeps_part_and_resumes_cancel_removes() {
+        let data = big_data();
+        let (url, _fails) = serve_slow(Arc::clone(&data), 0, 20);
+        let dir = tmp("pause");
+        let shared = item(&url, "big.bin");
+        // 받기 시작해 조금 진행되면 일시정지 신호를 보낸다
+        let stop = Arc::clone(&shared.lock().unwrap()[0].stop);
+        let watcher = Arc::clone(&shared);
+        let w_stop = Arc::clone(&stop);
+        thread::spawn(move || loop {
+            if let Status::Downloading { done, .. } = watcher.lock().unwrap()[0].status {
+                if done > 100_000 {
+                    w_stop.store(STOP_PAUSE, Relaxed);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        });
+        download(Arc::clone(&shared), 0, dir.clone(), 4);
+        let paused_done = match shared.lock().unwrap()[0].status {
+            Status::Paused { done, .. } => done,
+            _ => panic!("일시정지 상태여야 한다"),
+        };
+        assert!(paused_done > 100_000 && paused_done < data.len() as u64, "중간에 멈춰야 한다: {paused_done}");
+        assert!(dir.join("big.bin.part").exists() && dir.join("big.bin.meta").exists());
+        // 이어받기 → 완료, 내용 일치
+        stop.store(STOP_NONE, Relaxed);
+        download(Arc::clone(&shared), 0, dir.clone(), 4);
+        assert!(matches!(shared.lock().unwrap()[0].status, Status::Finished));
+        assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), *data);
+
+        // 취소: .part/.meta 가 지워진다
+        let dir2 = tmp("cancel");
+        let shared2 = item(&url, "big.bin");
+        shared2.lock().unwrap()[0].stop.store(STOP_CANCEL, Relaxed);
+        download(Arc::clone(&shared2), 0, dir2.clone(), 4);
+        assert!(matches!(shared2.lock().unwrap()[0].status, Status::Cancelled));
+        assert!(!dir2.join("big.bin.part").exists());
+        assert!(!dir2.join("big.bin.meta").exists());
+        assert!(!dir2.join("big.bin").exists());
     }
 
     #[test]
@@ -1395,6 +1812,8 @@ mod tests {
         assert_eq!(parse_urls("abchttps://a.com/x.jpg"), vec![]);
         assert_eq!(target_name(&e(1, "https://a.com/x/photo.JPG?x=1", Some("사진"))), "사진.JPG");
         assert_eq!(target_name(&e(1, "https://a.com/x/noext", Some("사진"))), "사진");
+        assert_eq!(target_name(&e(1, "https://a.com/rust-1.80.0.tar.gz", Some("툴체인"))), "툴체인.tar.gz");
+        assert_eq!(target_name(&e(1, "https://a.com/a.TAR.XZ", Some("x"))), "x.TAR.XZ");
         assert_eq!(target_name(&e(2, "https://a.com/x/photo.jpg", None)), "photo.jpg");
         let mut used = vec![];
         let d = std::env::temp_dir();
@@ -1433,6 +1852,11 @@ mod tests {
 
     // ---- Range 를 지원하는 작은 테스트 서버. `fails` 가 0 보다 크면 본문 1000 바이트 뒤에 연결을 끊는다 ----
     fn serve(data: Arc<Vec<u8>>, fails: usize) -> (String, Arc<AtomicUsize>) {
+        serve_slow(data, fails, 0)
+    }
+
+    /// `chunk_delay_ms` > 0 이면 64KB 마다 그만큼 쉬며 보낸다 (일시정지 테스트용)
+    fn serve_slow(data: Arc<Vec<u8>>, fails: usize, chunk_delay_ms: u64) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let fails = Arc::new(AtomicUsize::new(fails));
@@ -1440,13 +1864,13 @@ mod tests {
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let (data, f) = (Arc::clone(&data), Arc::clone(&f));
-                thread::spawn(move || handle(stream, data, f));
+                thread::spawn(move || handle(stream, data, f, chunk_delay_ms));
             }
         });
         (format!("http://127.0.0.1:{port}/big.bin"), fails)
     }
 
-    fn handle(mut s: TcpStream, data: Arc<Vec<u8>>, fails: Arc<AtomicUsize>) {
+    fn handle(mut s: TcpStream, data: Arc<Vec<u8>>, fails: Arc<AtomicUsize>, chunk_delay_ms: u64) {
         let mut range = None;
         let mut reader = std::io::BufReader::new(s.try_clone().unwrap());
         let mut line = String::new();
@@ -1482,7 +1906,15 @@ mod tests {
         head += "\r\n";
         let _ = s.write_all(head.as_bytes());
         let cut = body.len() > 1000 && fails.fetch_update(SeqCst, SeqCst, |v| v.checked_sub(1)).is_ok();
-        let _ = s.write_all(if cut { &body[..1000] } else { body });
+        let body = if cut { &body[..1000] } else { body };
+        for chunk in body.chunks(64 * 1024) {
+            if s.write_all(chunk).is_err() {
+                break;
+            }
+            if chunk_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(chunk_delay_ms));
+            }
+        }
         let _ = s.shutdown(Shutdown::Both);
     }
 

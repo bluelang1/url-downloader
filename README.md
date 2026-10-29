@@ -17,6 +17,11 @@ downloads and resuming interrupted transfers.
 - **이어받기**: 연결이 끊기면 받은 지점부터 자동 재시도(3회)하고, 그래도 실패하면 진행 기록을 남겨
   "다시 받기" 또는 앱 재실행 후 같은 폴더에 다시 받을 때 이어서 받습니다.
 - **다시 받기**: 실패한 항목만, 또는 체크한 항목만 골라 다시 받을 수 있습니다.
+- **속도·남은 시간**: 항목마다 현재 속도(MB/s)와 예상 남은 시간을 진행바에 표시합니다.
+- **일시정지·취소**: 항목별 또는 전체를 일시정지(받은 만큼 보존, ▶ 로 이어받기)하거나 취소(받던 파일 삭제)할 수 있습니다.
+- **저장 폴더 기억**: 한 번 고른 폴더와 동시·분할 설정을 기억해 다음엔 버튼 한 번으로 받습니다.
+- **완료 알림·Finder 열기**: 전부 끝나면 macOS 알림을 띄우고, 완료된 파일명을 누르면 Finder 에서 보여줍니다.
+- **드래그앤드롭**: URL 목록이 든 텍스트 파일을 창에 떨어뜨리면 입력창에 추가됩니다.
 - **이름 충돌 처리**: 같은 이름이 있으면 `이름 (1).ext` 처럼 번호를 붙입니다.
 - **자동 업데이트**: 제목 옆에 현재 버전이 표시되고, GitHub 릴리스에 새 버전이 있으면 그 옆에 업데이트 버튼이 나타납니다.
   누르면 새 `.app` 을 받아 제자리에서 교체하고 다시 시작합니다.
@@ -29,7 +34,8 @@ Rust 툴체인(`cargo`)이 필요합니다.
 ```sh
 git clone https://github.com/bluelang1/url-downloader.git
 cd url-downloader
-./bundle.sh        # release 빌드 → dist/URL Downloader.app + zip → /Applications 에 설치 (INSTALL=0 이면 설치 생략)
+./bundle.sh        # release 빌드 → dist/URL Downloader.app + zip → /Applications 에 설치
+                   # INSTALL=0: 설치 생략, UNIVERSAL=1: arm64+x86_64 universal 바이너리 (CI 가 사용)
 ```
 
 개발 중에는 `cargo run --release` 로 바로 띄울 수 있습니다.
@@ -73,7 +79,7 @@ cd url-downloader
 git tag v0.3.0 && git push origin main v0.3.0
 ```
 
-`release.yml` 이 macOS 에서 테스트·빌드 후 `URL-Downloader-v<버전>-macos-arm64.zip` 을 릴리스에 올리고,
+`release.yml` 이 macOS 에서 테스트·빌드 후 `URL-Downloader-v<버전>-macos-universal.zip`(Apple Silicon + Intel) 을 릴리스에 올리고,
 설치된 앱은 다음 실행 때 업데이트 버튼을 보여 줍니다. 태그와 `Cargo.toml` 버전이 다르면 워크플로가 실패합니다.
 
 터미널에서 확인할 때:
