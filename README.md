@@ -84,6 +84,11 @@ git tag v0.3.0 && git push origin main v0.3.0
 "/Applications/URL Downloader.app/Contents/MacOS/url_downloader" --self-update <zip-url>
 ```
 
+## 아이콘
+
+원본은 `assets/icon.png` 입니다. `assets/icon-1024.png`(모서리 투명, 창·Dock 아이콘으로 바이너리에 포함)와
+`assets/AppIcon.icns`(번들 아이콘)는 여기서 만든 파생물이니 원본을 바꾸면 둘 다 다시 만들어야 합니다.
+
 ## 개발
 
 ```sh

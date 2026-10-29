@@ -119,8 +119,12 @@ fn main() -> eframe::Result {
         }
         _ => {}
     }
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-1024.png"))
+        .expect("assets/icon-1024.png 는 유효한 PNG 여야 한다");
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 580.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([720.0, 580.0])
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
