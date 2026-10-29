@@ -18,6 +18,7 @@ struct Item {
     url: String,
     name: String,
     status: Status,
+    selected: bool,
 }
 
 type Shared = Arc<Mutex<Vec<Item>>>;
@@ -140,23 +141,57 @@ impl eframe::App for App {
             ui.add_space(8.0);
             ui.separator();
 
-            let items = self.items.lock().unwrap();
-            let finished = items.iter().filter(|i| matches!(i.status, Status::Finished)).count();
-            let failed = items.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
-            if !items.is_empty() {
-                let (text, color) = if running {
-                    (format!("진행 중  {} / {}", finished + failed, items.len()), egui::Color32::LIGHT_BLUE)
-                } else if failed == 0 {
-                    (format!("✅ 완료  {} / {}", finished, items.len()), egui::Color32::LIGHT_GREEN)
-                } else {
-                    (format!("⚠ 완료 {}개, 실패 {}개", finished, failed), egui::Color32::LIGHT_RED)
-                };
-                ui.colored_label(color, egui::RichText::new(text).strong().size(16.0));
-                ui.add_space(4.0);
+            let mut retry = false;
+            {
+                let mut items = self.items.lock().unwrap();
+                let total = items.len();
+                let finished = items.iter().filter(|i| matches!(i.status, Status::Finished)).count();
+                let failed = items.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
+                let selected = items.iter().filter(|i| i.selected).count();
+                if total > 0 {
+                    let (text, color) = if running {
+                        (format!("진행 중  {} / {}", finished + failed, total), egui::Color32::LIGHT_BLUE)
+                    } else if failed == 0 {
+                        (format!("✅ 완료  {} / {}", finished, total), egui::Color32::LIGHT_GREEN)
+                    } else {
+                        (format!("⚠ 완료 {}개, 실패 {}개", finished, failed), egui::Color32::LIGHT_RED)
+                    };
+                    ui.horizontal(|ui| {
+                        let mut all = selected == total;
+                        if ui.add_enabled(!running, egui::Checkbox::without_text(&mut all)).changed() {
+                            for i in items.iter_mut() {
+                                i.selected = all;
+                            }
+                        }
+                        ui.colored_label(color, egui::RichText::new(text).strong().size(16.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!running && selected > 0, egui::Button::new(format!("선택한 것만 다시 받기 ({selected}개)")))
+                                .clicked()
+                            {
+                                retry = true;
+                            }
+                            if ui
+                                .add_enabled(!running && failed > 0, egui::Button::new(format!("실패한 것만 다시 받기 ({failed}개)")))
+                                .clicked()
+                            {
+                                for i in items.iter_mut() {
+                                    i.selected = matches!(i.status, Status::Failed(_));
+                                }
+                                retry = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            }
+            if retry {
+                self.retry_selected();
             }
 
+            let mut items = self.items.lock().unwrap();
             egui::ScrollArea::vertical().id_salt("list").show(ui, |ui| {
-                for item in items.iter() {
+                for item in items.iter_mut() {
                     let (mark, color) = match &item.status {
                         Status::Waiting => ("⏳", egui::Color32::GRAY),
                         Status::Downloading { .. } => ("⬇", egui::Color32::LIGHT_BLUE),
@@ -165,6 +200,7 @@ impl eframe::App for App {
                     };
                     ui.horizontal(|ui| {
                         ui.set_width(ui.available_width());
+                        ui.add_enabled(!running, egui::Checkbox::without_text(&mut item.selected));
                         ui.label(
                             egui::RichText::new(format!("{:>3}", item.line))
                                 .text_style(mono.clone())
@@ -180,7 +216,7 @@ impl eframe::App for App {
                         .on_hover_text(&item.url);
                     });
                     ui.horizontal(|ui| {
-                        ui.add_space(30.0);
+                        ui.add_space(54.0);
                         match &item.status {
                             Status::Downloading { done, total } => {
                                 let bar = match total {
@@ -223,12 +259,38 @@ impl App {
             .iter()
             .map(|(line, url)| {
                 let name = unique_name(&dir, &file_name_from_url(url, *line), &mut names);
-                Item { line: *line, url: url.clone(), name, status: Status::Waiting }
+                Item { line: *line, url: url.clone(), name, status: Status::Waiting, selected: false }
             })
             .collect();
         *self.items.lock().unwrap() = items;
 
         for idx in 0..urls.len() {
+            let shared = Arc::clone(&self.items);
+            let dir = dir.clone();
+            thread::spawn(move || download(shared, idx, dir));
+        }
+    }
+}
+
+impl App {
+    /// 선택된 항목만 같은 폴더에 다시 받는다
+    fn retry_selected(&mut self) {
+        let Some(dir) = self.folder.clone() else { return };
+        let idxs: Vec<usize> = {
+            let mut items = self.items.lock().unwrap();
+            let idxs: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.selected)
+                .map(|(i, _)| i)
+                .collect();
+            for &i in &idxs {
+                items[i].status = Status::Waiting;
+                items[i].selected = false;
+            }
+            idxs
+        };
+        for idx in idxs {
             let shared = Arc::clone(&self.items);
             let dir = dir.clone();
             thread::spawn(move || download(shared, idx, dir));
@@ -272,7 +334,11 @@ fn download(shared: Shared, idx: usize, dir: PathBuf) {
 
     match result {
         Ok(()) => set(Status::Finished),
-        Err(e) => set(Status::Failed(e)),
+        Err(e) => {
+            let mut items = shared.lock().unwrap();
+            items[idx].status = Status::Failed(e);
+            items[idx].selected = true;
+        }
     }
 }
 
@@ -358,11 +424,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_download_is_auto_selected() {
+        let shared: Shared = Arc::new(Mutex::new(vec![Item {
+            line: 1,
+            selected: false,
+            url: "https://www.rust-lang.org/this-does-not-exist-404".into(),
+            name: "x".into(),
+            status: Status::Waiting,
+        }]));
+        download(Arc::clone(&shared), 0, std::env::temp_dir());
+        let items = shared.lock().unwrap();
+        assert!(matches!(items[0].status, Status::Failed(_)));
+        assert!(items[0].selected);
+    }
+
+    #[test]
     fn downloads_real_file() {
         let dir = std::env::temp_dir().join(format!("ud_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let shared: Shared = Arc::new(Mutex::new(vec![Item {
             line: 1,
+            selected: false,
             url: "https://www.rust-lang.org/static/images/rust-logo-blk.svg".into(),
             name: "logo.svg".into(),
             status: Status::Waiting,
