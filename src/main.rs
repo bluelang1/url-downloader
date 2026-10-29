@@ -44,13 +44,28 @@ struct App {
     concurrent: usize,
     /// 파일 하나를 몇 개 연결로 나눠 받을지
     segments: usize,
+    help_open: bool,
+    about_open: bool,
+    /// 도움말에서 목차를 눌러 이동할 절 번호
+    help_jump: Option<usize>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self { input: String::new(), folder: None, items: Default::default(), concurrent: 3, segments: 4 }
+        Self {
+            input: String::new(),
+            folder: None,
+            items: Default::default(),
+            concurrent: 3,
+            segments: 4,
+            help_open: false,
+            about_open: false,
+            help_jump: None,
+        }
     }
 }
+
+const REPO_URL: &str = "https://github.com/bluelang1/url-downloader";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -98,6 +113,38 @@ impl eframe::App for App {
         if running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("정보", |ui| {
+                    if ui.button("URL Downloader 정보").clicked() {
+                        self.about_open = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("GitHub 저장소 열기").clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(REPO_URL));
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("도움말", |ui| {
+                    if ui.button("사용법 전체 보기").clicked() {
+                        self.help_open = true;
+                        self.help_jump = Some(0);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    for (i, sec) in HELP.iter().enumerate() {
+                        if ui.button(format!("{}. {}", i + 1, sec.title)).clicked() {
+                            self.help_open = true;
+                            self.help_jump = Some(i);
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        });
+        self.help_window(ctx);
+        self.about_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("링크 목록 (한 줄에 하나)");
@@ -283,7 +330,214 @@ impl eframe::App for App {
     }
 }
 
+/// 도움말 한 절
+struct Section {
+    title: &'static str,
+    blocks: &'static [Block],
+}
+
+enum Block {
+    Text(&'static str),
+    Bullets(&'static [&'static str]),
+    Code(&'static str),
+}
+use Block::{Bullets, Code, Text};
+
+const HELP: &[Section] = &[
+    Section {
+        title: "시작하기",
+        blocks: &[
+            Text("URL 목록을 붙여넣고 저장할 폴더만 고르면 한꺼번에 내려받는 프로그램입니다. 큰 파일은 여러 연결로 나눠 받고, 끊기면 받은 곳부터 이어서 받습니다."),
+            Bullets(&[
+                "① 위쪽 입력창에 링크를 한 줄에 하나씩 붙여넣습니다.",
+                "② 필요하면 [동시 파일] / [파일당 분할] 숫자를 조정합니다.",
+                "③ [다운로드 (N개)] 버튼을 누르고 저장할 폴더를 고릅니다.",
+                "④ 아래 목록에서 진행 상황을 확인합니다. 끝나면 [폴더 열기] 로 바로 열 수 있습니다.",
+            ]),
+            Text("버튼의 N 은 입력창에서 URL 로 인식된 줄 수입니다. http:// 또는 https:// 로 시작하지 않는 줄은 무시됩니다."),
+        ],
+    },
+    Section {
+        title: "입력 형식",
+        blocks: &[
+            Text("한 줄에 항목 하나입니다. URL 만 쓰거나, 저장할 파일명을 함께 쓸 수 있습니다."),
+            Code("https://example.com/files/photo.jpg\n여행 사진<Tab>https://example.com/files/photo.jpg\n여행 사진 | https://example.com/files/photo.jpg\nhttps://example.com/files/photo.jpg<Tab>여행 사진"),
+            Bullets(&[
+                "URL 만 있으면 URL 의 원본 파일명(photo.jpg)으로 저장합니다.",
+                "파일명과 URL 사이 구분자는 탭, 공백, 세로줄(|), 쉼표(,) 중 아무거나 됩니다.",
+                "파일명과 URL 의 순서는 바뀌어도 됩니다. http(s):// 가 있는 쪽을 URL 로 봅니다.",
+                "파일명에는 확장자를 쓰지 마세요. 원본 URL 의 확장자(.jpg 등)가 자동으로 붙습니다.",
+                "스프레드시트에서 '파일명, URL' 두 열을 복사해 붙이면 탭으로 구분돼 그대로 동작합니다.",
+                "파일명에 쓸 수 없는 문자  / \\ : * ? \" < > |  는 밑줄(_)로 바뀝니다.",
+                "빈 줄이나 URL 이 없는 줄은 건너뜁니다. 왼쪽 줄 번호가 목록의 번호와 같아서 어느 줄인지 찾기 쉽습니다.",
+            ]),
+        ],
+    },
+    Section {
+        title: "다운로드 설정",
+        blocks: &[
+            Bullets(&[
+                "동시 파일 (기본 3): 한 번에 받는 파일 수입니다. 나머지는 '대기' 상태로 줄을 서 있다가 앞 파일이 끝나면 시작합니다.",
+                "파일당 분할 (기본 4): 파일 하나를 몇 개 연결로 나눠 받을지입니다. 서버가 Range 요청을 지원하고 파일이 1 MB 이상일 때만 적용됩니다.",
+                "실제로 열리는 연결 수는 두 값의 곱입니다(기본 3 × 4 = 12). 서버가 연결 수를 제한하거나 속도가 오히려 떨어지면 분할 수를 1~2 로 낮추세요.",
+                "두 값은 다운로드가 진행 중일 때는 바꿀 수 없습니다. 다시 받기에도 현재 값이 적용됩니다.",
+            ]),
+        ],
+    },
+    Section {
+        title: "진행 상황 보기",
+        blocks: &[
+            Bullets(&[
+                "⏳ 대기: 차례를 기다리는 중",
+                "⬇ 진행: 받는 중. 진행바에 받은 크기 / 전체 크기가 표시되고, 분할 중이면 'N분할' 이 함께 보입니다.",
+                "✅ 완료: 최종 파일명으로 저장됨",
+                "❌ 실패: 사유가 빨간 글씨로 표시되고 체크박스가 자동으로 켜집니다.",
+            ]),
+            Text("목록 위의 요약 줄에는 전체 / 완료 / 실패 개수가 표시됩니다. 전체 크기를 알려주지 않는 서버는 진행바 대신 받은 크기만 움직입니다."),
+        ],
+    },
+    Section {
+        title: "다시 받기",
+        blocks: &[
+            Bullets(&[
+                "[실패한 것만 다시 받기]: 실패 항목을 모두 골라 다시 받습니다.",
+                "[선택한 것만 다시 받기]: 체크박스를 켠 항목만 다시 받습니다. 맨 위 체크박스로 전체 선택/해제할 수 있습니다.",
+                "다시 받기는 처음 고른 폴더에 저장합니다. 이어받기 기록이 있으면 받은 곳부터 이어서 받습니다(다음 절 참고).",
+                "[지우기] 는 입력창과 목록을 비웁니다. 이미 받은 파일은 지우지 않습니다.",
+            ]),
+        ],
+    },
+    Section {
+        title: "이어받기와 분할 다운로드",
+        blocks: &[
+            Text("서버가 HTTP Range 를 지원하면 파일을 구간으로 나눠 동시에 받고, 받은 만큼을 기록해 두었다가 끊겨도 이어서 받습니다."),
+            Bullets(&[
+                "받는 동안 저장 폴더에 '<파일명>.part'(본문)와 '<파일명>.meta'(구간별 진행 기록)가 생깁니다. 완료되면 .part 가 최종 이름으로 바뀌고 .meta 는 지워집니다.",
+                "연결이 끊기면 구간별로 받은 지점부터 2초 간격으로 3회 자동 재시도합니다.",
+                "그래도 실패하면 .part 와 .meta 를 남겨 둡니다. [다시 받기] 를 누르거나, 앱을 껐다 켠 뒤 같은 URL 을 같은 폴더에 다시 받으면 받은 곳부터 이어집니다.",
+                "서버의 파일 크기나 ETag 가 달라졌으면 안전하게 처음부터 다시 받습니다.",
+                "진행 기록은 1초마다 저장되므로 강제 종료 시 최대 1초치는 다시 받습니다.",
+                "Range 를 지원하지 않는 서버는 한 줄기로 처음부터 받습니다. 이 경우 분할과 이어받기는 되지 않습니다.",
+                "1 MB 미만 파일은 분할하지 않습니다.",
+            ]),
+        ],
+    },
+    Section {
+        title: "파일명 규칙",
+        blocks: &[
+            Bullets(&[
+                "파일명을 지정하지 않으면 URL 경로의 마지막 부분을 씁니다. %20 같은 인코딩은 풀어서 저장합니다(photo%20one.jpg → photo one.jpg).",
+                "URL 에 파일명이 없으면(예: https://example.com/) 'file_<줄번호>' 로 저장합니다.",
+                "지정한 파일명 + 원본 확장자로 저장합니다. 원본 URL 에 확장자가 없으면 확장자 없이 저장됩니다.",
+                "같은 이름의 파일이 폴더에 이미 있거나 목록 안에서 겹치면 '이름 (1).jpg', '이름 (2).jpg' 처럼 번호를 붙입니다.",
+            ]),
+        ],
+    },
+    Section {
+        title: "문제 해결",
+        blocks: &[
+            Bullets(&[
+                "HTTP 403 / 404: 주소가 틀렸거나 로그인·쿠키가 필요한 링크입니다. 브라우저에서 직접 열리는 주소인지 확인하세요.",
+                "HTTP 429 / 503: 서버가 요청을 제한하고 있습니다. 동시 파일 수와 분할 수를 줄이고 잠시 뒤 다시 받으세요.",
+                "'HTTP 200 (Range 거부)': 서버가 처음엔 Range 를 받아 주다가 중간에 거부한 경우입니다. 분할 수를 1 로 놓고 다시 받으세요.",
+                "'연결 끊김': 3회 재시도 후에도 끊긴 상태입니다. 네트워크를 확인하고 [실패한 것만 다시 받기] 를 누르면 이어서 받습니다.",
+                "폴더에 .part / .meta 파일이 남아 있다면 받다 만 흔적입니다. 다시 받을 계획이 없으면 지워도 됩니다.",
+                "버그 제보나 제안은 [정보 → GitHub 저장소 열기] 의 Issues 에 남겨 주세요.",
+            ]),
+        ],
+    },
+];
+
 impl App {
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.help_open;
+        egui::Window::new("도움말")
+            .open(&mut open)
+            .default_size([680.0, 500.0])
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        ui.strong("목차");
+                        ui.add_space(4.0);
+                        for (i, sec) in HELP.iter().enumerate() {
+                            if ui.link(format!("{}. {}", i + 1, sec.title)).clicked() {
+                                self.help_jump = Some(i);
+                            }
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("help")
+                        .max_height(ui.available_height())
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            for (i, sec) in HELP.iter().enumerate() {
+                                let heading = ui.heading(format!("{}. {}", i + 1, sec.title));
+                                if self.help_jump == Some(i) {
+                                    heading.scroll_to_me(Some(egui::Align::TOP));
+                                    self.help_jump = None;
+                                }
+                                ui.add_space(4.0);
+                                for block in sec.blocks {
+                                    match block {
+                                        Text(t) => {
+                                            ui.label(*t);
+                                        }
+                                        Bullets(items) => {
+                                            for it in items.iter() {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label("•");
+                                                    ui.label(*it);
+                                                });
+                                            }
+                                        }
+                                        Code(c) => {
+                                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.label(egui::RichText::new(*c).monospace());
+                                            });
+                                        }
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                                ui.add_space(14.0);
+                            }
+                        });
+                });
+            });
+        self.help_open = open;
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.about_open;
+        egui::Window::new("URL Downloader 정보")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(6.0);
+                    ui.heading("URL Downloader");
+                    ui.label(format!("버전 {}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(8.0);
+                    ui.label("URL 목록을 붙여넣고 폴더만 고르면 한꺼번에 내려받는 프로그램.");
+                    ui.label("분할 다운로드와 이어받기를 지원합니다.");
+                    ui.add_space(8.0);
+                    ui.hyperlink_to("GitHub: bluelang1/url-downloader", REPO_URL);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("MIT License  ·  © 2026 bluelang1").color(egui::Color32::GRAY));
+                    ui.label(
+                        egui::RichText::new("Rust · egui/eframe · reqwest · rfd")
+                            .color(egui::Color32::GRAY)
+                            .small(),
+                    );
+                    ui.add_space(6.0);
+                });
+            });
+        self.about_open = open;
+    }
+
     fn is_running(&self) -> bool {
         self.items.lock().unwrap().iter().any(|i| {
             matches!(i.status, Status::Waiting | Status::Downloading { .. })
