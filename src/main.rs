@@ -14,6 +14,7 @@ enum Status {
 }
 
 struct Item {
+    line: usize,
     url: String,
     name: String,
     status: Status,
@@ -78,15 +79,34 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("링크 목록 (한 줄에 하나)");
             ui.add_space(4.0);
+
+            let mono = egui::TextStyle::Monospace;
+            let row_h = ui.text_style_height(&mono);
+            let line_count = self.input.split('\n').count().max(1);
             egui::ScrollArea::vertical()
                 .id_salt("input")
-                .max_height(180.0)
+                .max_height(200.0)
                 .show(ui, |ui| {
-                    ui.add_sized(
-                        [ui.available_width(), 170.0],
-                        egui::TextEdit::multiline(&mut self.input)
-                            .hint_text("https://... 링크를 붙여넣으세요"),
-                    );
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // 줄 번호 거터
+                        let gutter: String = (1..=line_count)
+                            .map(|n| format!("{n:>3}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(gutter).text_style(mono.clone()).color(egui::Color32::GRAY),
+                            )
+                            .selectable(false),
+                        );
+                        ui.add_sized(
+                            [ui.available_width(), (line_count.max(8)) as f32 * row_h + 8.0],
+                            egui::TextEdit::multiline(&mut self.input)
+                                .font(mono.clone())
+                                .hint_text("https://... 링크를 붙여넣으세요"),
+                        );
+                    });
                 });
 
             ui.add_space(8.0);
@@ -109,8 +129,11 @@ impl eframe::App for App {
                     self.input.clear();
                     self.items.lock().unwrap().clear();
                 }
-                if let Some(dir) = &self.folder {
-                    ui.label(format!("→ {}", dir.display()));
+                if let Some(dir) = self.folder.clone() {
+                    if ui.button("폴더 열기").clicked() {
+                        let _ = std::process::Command::new("open").arg(&dir).spawn();
+                    }
+                    ui.label(egui::RichText::new(dir.display().to_string()).color(egui::Color32::GRAY));
                 }
             });
 
@@ -121,51 +144,65 @@ impl eframe::App for App {
             let finished = items.iter().filter(|i| matches!(i.status, Status::Finished)).count();
             let failed = items.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
             if !items.is_empty() {
-                let text = if running {
-                    format!("진행 중  {} / {}", finished + failed, items.len())
+                let (text, color) = if running {
+                    (format!("진행 중  {} / {}", finished + failed, items.len()), egui::Color32::LIGHT_BLUE)
                 } else if failed == 0 {
-                    format!("✅ 완료  {} / {}", finished, items.len())
+                    (format!("✅ 완료  {} / {}", finished, items.len()), egui::Color32::LIGHT_GREEN)
                 } else {
-                    format!("⚠ 완료 {}개, 실패 {}개", finished, failed)
+                    (format!("⚠ 완료 {}개, 실패 {}개", finished, failed), egui::Color32::LIGHT_RED)
                 };
-                ui.strong(text);
+                ui.colored_label(color, egui::RichText::new(text).strong().size(16.0));
                 ui.add_space(4.0);
             }
 
             egui::ScrollArea::vertical().id_salt("list").show(ui, |ui| {
                 for item in items.iter() {
+                    let (mark, color) = match &item.status {
+                        Status::Waiting => ("⏳", egui::Color32::GRAY),
+                        Status::Downloading { .. } => ("⬇", egui::Color32::LIGHT_BLUE),
+                        Status::Finished => ("✅", egui::Color32::LIGHT_GREEN),
+                        Status::Failed(_) => ("❌", egui::Color32::LIGHT_RED),
+                    };
                     ui.horizontal(|ui| {
                         ui.set_width(ui.available_width());
-                        let (mark, color) = match &item.status {
-                            Status::Waiting => ("⏳", egui::Color32::GRAY),
-                            Status::Downloading { .. } => ("⬇", egui::Color32::LIGHT_BLUE),
-                            Status::Finished => ("✅", egui::Color32::LIGHT_GREEN),
-                            Status::Failed(_) => ("❌", egui::Color32::LIGHT_RED),
-                        };
+                        ui.label(
+                            egui::RichText::new(format!("{:>3}", item.line))
+                                .text_style(mono.clone())
+                                .strong(),
+                        );
                         ui.colored_label(color, mark);
-                        ui.label(&item.name).on_hover_text(&item.url);
+                        ui.label(egui::RichText::new(&item.name).strong());
+                        ui.label(
+                            egui::RichText::new(shorten(&item.url, 60))
+                                .color(egui::Color32::GRAY)
+                                .small(),
+                        )
+                        .on_hover_text(&item.url);
                     });
-                    match &item.status {
-                        Status::Downloading { done, total } => {
-                            let bar = match total {
-                                Some(t) if *t > 0 => egui::ProgressBar::new(*done as f32 / *t as f32)
-                                    .text(format!("{} / {}", fmt_bytes(*done), fmt_bytes(*t))),
-                                _ => egui::ProgressBar::new(0.0)
-                                    .animate(true)
-                                    .text(fmt_bytes(*done)),
-                            };
-                            ui.add(bar);
+                    ui.horizontal(|ui| {
+                        ui.add_space(30.0);
+                        match &item.status {
+                            Status::Downloading { done, total } => {
+                                let bar = match total {
+                                    Some(t) if *t > 0 => egui::ProgressBar::new(*done as f32 / *t as f32)
+                                        .text(format!("{} / {}", fmt_bytes(*done), fmt_bytes(*t))),
+                                    _ => egui::ProgressBar::new(0.0)
+                                        .animate(true)
+                                        .text(fmt_bytes(*done)),
+                                };
+                                ui.add(bar);
+                            }
+                            Status::Finished => {
+                                ui.add(egui::ProgressBar::new(1.0).fill(egui::Color32::from_rgb(60, 160, 90)).text("완료"));
+                            }
+                            Status::Failed(e) => {
+                                ui.colored_label(egui::Color32::LIGHT_RED, e);
+                            }
+                            Status::Waiting => {
+                                ui.add(egui::ProgressBar::new(0.0).text("대기"));
+                            }
                         }
-                        Status::Finished => {
-                            ui.add(egui::ProgressBar::new(1.0).text("완료"));
-                        }
-                        Status::Failed(e) => {
-                            ui.colored_label(egui::Color32::LIGHT_RED, e);
-                        }
-                        Status::Waiting => {
-                            ui.add(egui::ProgressBar::new(0.0).text("대기"));
-                        }
-                    }
+                    });
                     ui.add_space(6.0);
                 }
             });
@@ -180,14 +217,13 @@ impl App {
         })
     }
 
-    fn start(&mut self, urls: Vec<String>, dir: PathBuf) {
+    fn start(&mut self, urls: Vec<(usize, String)>, dir: PathBuf) {
         let mut names: Vec<String> = Vec::new();
         let items: Vec<Item> = urls
             .iter()
-            .enumerate()
-            .map(|(i, url)| {
-                let name = unique_name(&dir, &file_name_from_url(url, i), &mut names);
-                Item { url: url.clone(), name, status: Status::Waiting }
+            .map(|(line, url)| {
+                let name = unique_name(&dir, &file_name_from_url(url, *line), &mut names);
+                Item { line: *line, url: url.clone(), name, status: Status::Waiting }
             })
             .collect();
         *self.items.lock().unwrap() = items;
@@ -240,13 +276,26 @@ fn download(shared: Shared, idx: usize, dir: PathBuf) {
     }
 }
 
-fn parse_urls(input: &str) -> Vec<String> {
+/// (입력창 줄 번호(1부터), URL)
+fn parse_urls(input: &str) -> Vec<(usize, String)> {
     input
         .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
-        .map(String::from)
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.trim()))
+        .filter(|(_, l)| l.starts_with("http://") || l.starts_with("https://"))
+        .map(|(n, l)| (n, l.to_string()))
         .collect()
+}
+
+fn shorten(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max / 2 - 1).collect();
+        let tail: String = s.chars().skip(n - (max / 2 - 1)).collect();
+        format!("{head}…{tail}")
+    }
 }
 
 fn file_name_from_url(url: &str, idx: usize) -> String {
@@ -260,7 +309,7 @@ fn file_name_from_url(url: &str, idx: usize) -> String {
         .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
     if cleaned.is_empty() {
-        format!("file_{}", idx + 1)
+        format!("file_{idx}")
     } else {
         cleaned
     }
@@ -300,7 +349,8 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(file_name_from_url("https://a.com/x/y/photo%20one.jpg?x=1", 0), "photo one.jpg");
-        assert_eq!(file_name_from_url("https://a.com/", 2), "file_3");
+        assert_eq!(file_name_from_url("https://a.com/", 3), "file_3");
+        assert_eq!(parse_urls("https://a\n\nfoo\nhttps://b"), vec![(1, "https://a".into()), (4, "https://b".into())]);
         let mut used = vec![];
         let d = std::env::temp_dir();
         assert_eq!(unique_name(&d, "a.jpg", &mut used), "a.jpg");
@@ -312,6 +362,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ud_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let shared: Shared = Arc::new(Mutex::new(vec![Item {
+            line: 1,
             url: "https://www.rust-lang.org/static/images/rust-logo-blk.svg".into(),
             name: "logo.svg".into(),
             status: Status::Waiting,
