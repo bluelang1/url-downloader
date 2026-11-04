@@ -13,5 +13,4 @@
 
 ## 릴리스 (승인 후에만)
 - Cargo.toml version 올림 → `git tag vX.Y.Z` → main+태그 푸시 → Release 워크플로가 universal zip 업로드. 태그 ≠ Cargo 버전이면 CI 실패
-- 푸시는 bluelang1 토큰: `GH_TOKEN=$(gh auth token --user bluelang1)` + `-c http.extraheader="Authorization: Basic $(printf 'bluelang1:%s' "$GH_TOKEN" | base64)"`
 - 배포 확인: `gh api repos/bluelang1/url-downloader/releases/latest --jq .tag_name` 와 설치 앱 `--check-update`. 미인증 API 는 IP 당 60회/시간이라 리뷰 중 많이 찌르면 앱 확인이 403 - `gh api` 로 대신 확인하고 리셋(`x-ratelimit-reset`) 후 재시도
