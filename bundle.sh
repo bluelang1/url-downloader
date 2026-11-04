@@ -7,6 +7,17 @@ APP="dist/$NAME.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 # UNIVERSAL=1 이면 arm64 + x86_64 를 lipo 로 합친다 (CI). 아니면 호스트 아키텍처만.
 if [ "${UNIVERSAL:-0}" = "1" ]; then
+  # 두 타깃이 설치돼 있지 않으면 cargo 오류 대신 설치 방법을 알려 주고 멈춘다
+  INSTALLED=$(rustup target list --installed 2>/dev/null || true)
+  MISSING=""
+  for T in aarch64-apple-darwin x86_64-apple-darwin; do
+    echo "$INSTALLED" | grep -qx "$T" || MISSING="$MISSING $T"
+  done
+  if [ -n "$MISSING" ]; then
+    echo "UNIVERSAL=1 빌드에 필요한 Rust 타깃이 없습니다:$MISSING" >&2
+    echo "설치: rustup target add$MISSING" >&2
+    exit 1
+  fi
   cargo build --release --target aarch64-apple-darwin --target x86_64-apple-darwin
   mkdir -p target/universal
   lipo -create -output target/universal/url_downloader \
