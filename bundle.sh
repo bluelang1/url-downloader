@@ -33,6 +33,8 @@ fi
 rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/url_downloader"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+# 라이선스 고지 (서드파티 고지는 cargo about 로 생성해 커밋한 파일)
+cp LICENSE THIRD-PARTY-LICENSES.html "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

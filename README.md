@@ -106,3 +106,6 @@ cargo build --release
 ## 라이선스
 
 [MIT](LICENSE)
+
+앱에 포함된 오픈소스 구성요소(Rust 크레이트, egui 내장 글꼴)의 저작권 고지와 라이선스 전문은
+[THIRD-PARTY-LICENSES.html](THIRD-PARTY-LICENSES.html) 에 있고, 앱 번들의 `Contents/Resources/` 에도 함께 들어갑니다.

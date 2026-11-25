@@ -4,6 +4,7 @@
 - `cargo test` - 62개, ~5초. 로컬 Range 서버로 분할·이어받기까지 검증
 - `cargo build --release 2>&1 | grep -c ^warning` - 경고 0 유지
 - 앱 확인은 `cargo run --release`. 로컬 패키징·재설치(bundle.sh)는 CI·비상용
+- 의존성을 바꾸면 고지 파일 재생성: `cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.html` (cargo-about, `--features cli` 로 설치)
 
 ## 개발용 환경변수 (src/main.rs)
 - `URL_DOWNLOADER_INPUT` / `URL_DOWNLOADER_AUTOSTART=1` - 입력 채우고 자동 시작
