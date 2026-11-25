@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// TODO(2단계): 화면·다운로드 엔진에 연결하면 allow 를 뗀다
+#[allow(dead_code)]
+mod s3;
+
 const REPO: &str = "bluelang1/url-downloader";
 
 /// 분할 구간 하나의 최소 크기. 이보다 작은 파일은 분할하지 않는다
@@ -2097,7 +2101,7 @@ fn file_name_from_url(url: &str, idx: usize) -> String {
     }
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     name.trim()
         .chars()
         .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
