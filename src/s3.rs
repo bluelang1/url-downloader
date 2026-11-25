@@ -372,26 +372,9 @@ pub fn get_session_token(
     }
     let base = endpoint_override.unwrap_or(STS_ENDPOINT).trim_end_matches('/');
     let host = base.split_once("://").map_or(base, |(_, h)| h).split('/').next().unwrap_or("").to_string();
-    let body = format!(
-        "Action=GetSessionToken&Version=2011-06-15&DurationSeconds={}&SerialNumber={}&TokenCode={}",
-        duration_secs.clamp(STS_MIN_DURATION, STS_MAX_DURATION),
-        uri_encode(serial.trim(), false),
-        code
-    );
-    let content_type = "application/x-www-form-urlencoded; charset=utf-8";
+    let (body, auth) = sts_signed_request(long_term, serial, code, duration_secs, now_unix, &host);
+    let content_type = STS_CONTENT_TYPE;
     let date = amz_date(now_unix);
-    let mut headers = vec![("content-type", content_type), ("host", host.as_str()), ("x-amz-date", date.as_str())];
-    if let Some(t) = &long_term.session_token {
-        headers.push(("x-amz-security-token", t.as_str()));
-    }
-    let canonical = canonical_request("POST", "/", "", &headers, &sha256_hex(body.as_bytes()));
-    let sig = signature(&long_term.secret_key, now_unix, "us-east-1", "sts", &canonical);
-    let auth = format!(
-        "{ALGORITHM} Credential={}/{}, SignedHeaders={}, Signature={sig}",
-        long_term.access_key,
-        scope(now_unix, "us-east-1", "sts"),
-        signed_headers(&headers)
-    );
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -410,6 +393,32 @@ pub fn get_session_token(
     let status = resp.status().as_u16();
     let text = resp.text().map_err(|e| StsError::Other(format!("STS 응답 읽기 실패: {}", e.without_url())))?;
     parse_sts_response(status, &text)
+}
+
+const STS_CONTENT_TYPE: &str = "application/x-www-form-urlencoded; charset=utf-8";
+
+/// GetSessionToken 요청 본문과 Authorization 헤더 값 (content-type·host·x-amz-date[·x-amz-security-token] 서명)
+fn sts_signed_request(long_term: &Creds, serial: &str, code: &str, duration_secs: u64, now_unix: u64, host: &str) -> (String, String) {
+    let body = format!(
+        "Action=GetSessionToken&Version=2011-06-15&DurationSeconds={}&SerialNumber={}&TokenCode={}",
+        duration_secs.clamp(STS_MIN_DURATION, STS_MAX_DURATION),
+        uri_encode(serial.trim(), false),
+        code
+    );
+    let date = amz_date(now_unix);
+    let mut headers = vec![("content-type", STS_CONTENT_TYPE), ("host", host), ("x-amz-date", date.as_str())];
+    if let Some(t) = &long_term.session_token {
+        headers.push(("x-amz-security-token", t.as_str()));
+    }
+    let canonical = canonical_request("POST", "/", "", &headers, &sha256_hex(body.as_bytes()));
+    let sig = signature(&long_term.secret_key, now_unix, "us-east-1", "sts", &canonical);
+    let auth = format!(
+        "{ALGORITHM} Credential={}/{}, SignedHeaders={}, Signature={sig}",
+        long_term.access_key,
+        scope(now_unix, "us-east-1", "sts"),
+        signed_headers(&headers)
+    );
+    (body, auth)
 }
 
 /// GetSessionToken 응답 XML 해석. 2xx 가 아니면 `<Code>`/`<Message>` 로 에러를 만든다.
@@ -453,8 +462,9 @@ fn xml_tag(xml: &str, tag: &str) -> Option<String> {
 
 // ---------------------------------------------------------------- 세션 캐시
 
-/// 세션을 JSON 으로 저장 (권한 0600, 같은 폴더 임시 파일에 쓴 뒤 rename)
-pub fn save_session(path: &Path, creds: &Creds) -> io::Result<()> {
+/// 세션을 JSON 으로 저장 (권한 0600, 같은 폴더 임시 파일에 쓴 뒤 rename).
+/// `owner` 는 이 세션을 발급한 장기 키의 액세스 키 ID (비밀 아님). 불러올 때 지금 장기 키와 같은지 본다
+pub fn save_session(path: &Path, creds: &Creds, owner: &str) -> io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -464,6 +474,7 @@ pub fn save_session(path: &Path, creds: &Creds) -> io::Result<()> {
         "secret_key": creds.secret_key,
         "session_token": creds.session_token,
         "expires_at": creds.expires_at,
+        "owner_access_key": owner,
     });
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -478,9 +489,13 @@ pub fn save_session(path: &Path, creds: &Creds) -> io::Result<()> {
 }
 
 /// 저장된 세션. 파일이 없거나 깨졌거나, 토큰·만료 시각이 없거나, 남은 시간이 60초 미만이면 None.
-pub fn load_session(path: &Path, now_unix: u64) -> Option<Creds> {
+/// 발급한 장기 키 ID(`owner_access_key`)가 없거나(옛 파일) `owner` 와 다르면(다른 장기 키·프로필의 세션) None
+pub fn load_session(path: &Path, owner: &str, now_unix: u64) -> Option<Creds> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string);
+    if owner.is_empty() || s("owner_access_key")? != owner {
+        return None;
+    }
     let expires_at = v.get("expires_at")?.as_u64()?;
     if expires_at < now_unix.saturating_add(MIN_REMAINING_SECS) {
         return None;
@@ -507,7 +522,8 @@ pub struct S3Line {
 
 /// 한 줄 형식: `키` | `이름<Tab>키` | `이름 | 키` | `키<Tab>이름` | `키 | 이름` (`s3://버킷/키` 도 허용).
 /// 구분자는 탭과 `|` 뿐 (공백·쉼표는 키의 일부). 두 조각 중 `s3://` 로 시작하는 쪽, 아니면 `/` 가 든 쪽이 키.
-/// 판단이 안 서면(둘 다/둘 다 아님) 뒤쪽이 키. 빈 줄·`#` 주석·조각이 셋 이상이면 None.
+/// 둘 다 `/` 가 없으면 한쪽만 확장자(`.` 뒤 1~8자 영숫자)가 있을 때 그쪽이 키.
+/// 그래도 판단이 안 서면(둘 다/둘 다 아님) 뒤쪽이 키. 키 맨 앞의 `/` 는 버린다. 빈 줄·`#` 주석·조각이 셋 이상이면 None.
 pub fn parse_s3_line(line: &str) -> Option<S3Line> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -518,9 +534,13 @@ pub fn parse_s3_line(line: &str) -> Option<S3Line> {
         [k] => (k, None),
         [a, b] => {
             let is_url = |p: &str| p.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("s3://"));
+            let has_ext = |p: &str| {
+                p.rsplit_once('.').is_some_and(|(_, e)| (1..=8).contains(&e.len()) && e.bytes().all(|c| c.is_ascii_alphanumeric()))
+            };
             let a_is_key = match (is_url(a), is_url(b)) {
                 (true, false) => true,
                 (false, true) => false,
+                _ if !a.contains('/') && !b.contains('/') => has_ext(a) && !has_ext(b),
                 _ => a.contains('/') && !b.contains('/'),
             };
             if a_is_key { (a, Some(b)) } else { (b, Some(a)) }
@@ -834,12 +854,35 @@ mfa_serial = should-not-match
         assert!(auth.to_string().to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()), "{auth}");
         let sig = auth.rsplit("Signature=").next().unwrap().trim();
         assert!(sig.len() == 64 && sig.bytes().all(|b| b.is_ascii_hexdigit()), "{sig}");
+        // 보낸 서명은 같은 입력(가짜 서버의 host)으로 만든 서명과 같다
+        let host = base.trim_start_matches("http://");
+        let (_, expect) = sts_signed_request(&example_creds(), serial, "123456", 43_200, 1_369_353_600, host);
+        assert_eq!(auth.split_once(':').unwrap().1.trim(), expect);
         assert!(lower.contains("x-amz-date: 20130524t000000z\r\n"));
         assert!(lower.contains("content-type: application/x-www-form-urlencoded; charset=utf-8\r\n"));
         assert!(req.ends_with(
             "Action=GetSessionToken&Version=2011-06-15&DurationSeconds=43200\
              &SerialNumber=arn%3Aaws%3Aiam%3A%3A123456789012%3Amfa%2Fexample-user&TokenCode=123456"
         ));
+    }
+
+    /// 고정 시각·고정 입력·실제 STS host 의 Authorization 전체 값. 값은 현재 구현 출력으로 고정했다
+    /// (서명 경로의 canonical request 는 header_signing_matches_aws_test_suite 의 AWS 테스트 스위트 두 벡터와 같은 함수)
+    #[test]
+    fn sts_signature_is_pinned() {
+        let serial = "arn:aws:iam::123456789012:mfa/example-user";
+        let (body, auth) = sts_signed_request(&example_creds(), serial, "123456", 43_200, 1_369_353_600, "sts.amazonaws.com");
+        assert_eq!(
+            body,
+            "Action=GetSessionToken&Version=2011-06-15&DurationSeconds=43200\
+             &SerialNumber=arn%3Aaws%3Aiam%3A%3A123456789012%3Amfa%2Fexample-user&TokenCode=123456"
+        );
+        assert_eq!(
+            auth,
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/sts/aws4_request, \
+             SignedHeaders=content-type;host;x-amz-date, \
+             Signature=d8b55ed75840bbc4976e354df12f81077fab1aa3554c034701f3d858d7a019f2"
+        );
     }
 
     #[test]
@@ -872,23 +915,46 @@ mfa_serial = should-not-match
             session_token: Some("AQoEXAMPLETOKEN".into()),
             expires_at: Some(10_000),
         };
-        save_session(&path, &creds).unwrap();
+        const OWNER: &str = "AKIAIOSFODNN7EXAMPLE";
+        save_session(&path, &creds, OWNER).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(!path.with_extension("json.tmp").exists());
-        assert_eq!(load_session(&path, 5_000), Some(creds.clone()));
-        assert_eq!(load_session(&path, 10_000 - 60), Some(creds.clone()));
-        assert_eq!(load_session(&path, 10_000 - 59), None);
-        assert_eq!(load_session(&path, 20_000), None);
+        assert_eq!(load_session(&path, OWNER, 5_000), Some(creds.clone()));
+        assert_eq!(load_session(&path, OWNER, 10_000 - 60), Some(creds.clone()));
+        assert_eq!(load_session(&path, OWNER, 10_000 - 59), None);
+        assert_eq!(load_session(&path, OWNER, 20_000), None);
         // 덮어쓰기
         let newer = Creds { expires_at: Some(50_000), ..creds.clone() };
-        save_session(&path, &newer).unwrap();
-        assert_eq!(load_session(&path, 20_000), Some(newer));
+        save_session(&path, &newer, OWNER).unwrap();
+        assert_eq!(load_session(&path, OWNER, 20_000), Some(newer));
         // 깨진 파일·없는 파일·토큰 없는 세션
         std::fs::write(&path, "{not json").unwrap();
-        assert_eq!(load_session(&path, 0), None);
-        assert_eq!(load_session(&path.with_file_name("missing.json"), 0), None);
-        save_session(&path, &Creds { session_token: None, ..creds }).unwrap();
-        assert_eq!(load_session(&path, 0), None);
+        assert_eq!(load_session(&path, OWNER, 0), None);
+        assert_eq!(load_session(&path.with_file_name("missing.json"), OWNER, 0), None);
+        save_session(&path, &Creds { session_token: None, ..creds }, OWNER).unwrap();
+        assert_eq!(load_session(&path, OWNER, 0), None);
+    }
+
+    /// 세션 파일에는 발급한 장기 키 ID(비밀 아님)가 함께 남고, 다른 장기 키로는 쓰지 않는다. 주인 정보 없는 옛 파일은 무효
+    #[test]
+    fn session_cache_owner_must_match() {
+        let path = tmp("session_owner").join("session.json");
+        let creds = Creds {
+            access_key: "ASIAIOSFODNN7EXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY".into(),
+            session_token: Some("AQoEXAMPLETOKEN".into()),
+            expires_at: Some(10_000),
+        };
+        save_session(&path, &creds, "AKIAOWNEREXAMPLE").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("AKIAOWNEREXAMPLE"), "{raw}");
+        assert_eq!(load_session(&path, "AKIAOWNEREXAMPLE", 0), Some(creds.clone()));
+        assert_eq!(load_session(&path, "AKIAOTHEREXAMPLE", 0), None, "다른 장기 키가 발급한 세션");
+        assert_eq!(load_session(&path, "", 0), None, "현재 장기 키를 모르면 쓰지 않는다");
+        // 주인 정보가 없는 옛 형식
+        let old = r#"{"access_key":"ASIAIOSFODNN7EXAMPLE","secret_key":"s","session_token":"t","expires_at":10000}"#;
+        std::fs::write(&path, old).unwrap();
+        assert_eq!(load_session(&path, "AKIAOWNEREXAMPLE", 0), None);
     }
 
     // ---- 입력 줄
@@ -904,9 +970,21 @@ mfa_serial = should-not-match
         assert_eq!(parse_s3_line("보고서 | reports/a.pdf"), l("reports/a.pdf", Some("보고서"), None));
         assert_eq!(parse_s3_line("reports/a.pdf\t보고서"), l("reports/a.pdf", Some("보고서"), None));
         assert_eq!(parse_s3_line("reports/a.pdf | 보고서"), l("reports/a.pdf", Some("보고서"), None));
-        // 둘 다 `/` 없음, 둘 다 있음 → 뒤쪽이 키
-        assert_eq!(parse_s3_line("이름 | a.pdf"), l("a.pdf", Some("이름"), None));
+        // 둘 다 `/` 있음 → 뒤쪽이 키
         assert_eq!(parse_s3_line("x/y | reports/a.pdf"), l("reports/a.pdf", Some("x_y"), None));
+        // 둘 다 `/` 없음: 한쪽만 확장자(`.` 뒤 1~8자 영숫자)가 있으면 그쪽이 키
+        assert_eq!(parse_s3_line("이름 | a.pdf"), l("a.pdf", Some("이름"), None));
+        assert_eq!(parse_s3_line("a.pdf | 이름"), l("a.pdf", Some("이름"), None));
+        assert_eq!(parse_s3_line("a.pdf\t보고서"), l("a.pdf", Some("보고서"), None));
+        assert_eq!(parse_s3_line("archive.tar.gz | 백업"), l("archive.tar.gz", Some("백업"), None));
+        assert_eq!(parse_s3_line("data.parquet2 | 이름"), l("data.parquet2", Some("이름"), None));
+        // 확장자로 치지 않는 꼴: 9자 이상, 영숫자 아님, `.` 으로 끝남 → 둘 다 없음 → 뒤쪽이 키
+        assert_eq!(parse_s3_line("a.verylongext | 이름"), l("이름", Some("a.verylongext"), None));
+        assert_eq!(parse_s3_line("a.b-c | 이름"), l("이름", Some("a.b-c"), None));
+        assert_eq!(parse_s3_line("a. | 이름"), l("이름", Some("a."), None));
+        // 둘 다 확장자 있음·둘 다 없음 → 뒤쪽이 키
+        assert_eq!(parse_s3_line("a.pdf | b.zip"), l("b.zip", Some("a.pdf"), None));
+        assert_eq!(parse_s3_line("이름 | 키"), l("키", Some("이름"), None));
         // s3:// 접두사
         assert_eq!(parse_s3_line("s3://example-bucket/reports/a.pdf"), l("reports/a.pdf", None, Some("example-bucket")));
         assert_eq!(parse_s3_line("S3://example-bucket/a.pdf | 이름"), l("a.pdf", Some("이름"), Some("example-bucket")));

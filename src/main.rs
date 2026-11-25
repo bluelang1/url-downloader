@@ -153,6 +153,8 @@ struct App {
     sts_endpoint: Option<String>,
     /// 테스트용: 자격증명·AWS 설정·세션 파일 경로. None 이면 HOME·환경변수 기준
     s3_files_override: Option<S3Files>,
+    /// [기기 변경] 을 눌러 설정의 기기 ARN 칸을 연 상태 (칸에서 포커스가 빠지면 닫는다)
+    mfa_serial_edit: bool,
 }
 
 /// MFA 세션 발급 작업 상태
@@ -339,6 +341,7 @@ impl Default for App {
             start_notice: None,
             sts_endpoint: std::env::var("URL_DOWNLOADER_STS_ENDPOINT").ok().filter(|s| !s.is_empty()),
             s3_files_override: None,
+            mfa_serial_edit: false,
         }
     }
 }
@@ -1057,14 +1060,16 @@ const HELP: &[Section] = &[
             Code("reports/2026/summary.pdf\n요약본 | reports/2026/summary.pdf\nreports/2026/summary.pdf<Tab>요약본\ns3://example-bucket/reports/2026/summary.pdf"),
             Bullets(&[
                 "이름과 경로 사이 구분자는 탭이나 세로줄(|) 뿐입니다. 공백·쉼표는 경로의 일부로 봅니다(예: 'photos/2026 봄, 여행.zip').",
+                "이름과 경로 중 / 가 든 쪽을 경로로 봅니다. 둘 다 / 가 없으면 확장자(. 뒤 1~8자의 영문·숫자)가 있는 쪽을 경로로 보고, 둘 다 있거나 둘 다 없으면 뒤쪽이 경로입니다(예: 'a.pdf | 보고서' 의 경로는 a.pdf).",
+                "경로 맨 앞의 / 는 무시합니다('/reports/a.pdf' 는 'reports/a.pdf'). 경로에 . 이나 .. 조각이 있으면(예: 'a/../b.zip', './a.zip') 서명이 맞지 않아 받을 수 없으므로 몇 번째 줄인지 알리고 시작하지 않습니다.",
                 "s3://버킷/경로 로 쓴 줄은 버킷 칸 대신 그 버킷에서 받습니다. 버킷 칸이 비어 있으면 모든 줄을 이 형식으로 써야 [다운로드] 가 켜집니다.",
                 "저장 파일명 규칙은 URL 모드와 같습니다. 이름을 주면 이름 + 원본 확장자, 없으면 경로의 마지막 부분입니다. 경로의 %20 같은 글자는 풀지 않고 그대로 씁니다.",
-                "자격증명은 이 순서로 찾습니다: ① 앱이 저장해 둔 세션(설정 폴더의 s3_session.json) ② 설정 s3_session_profile 에 적은 ~/.aws/credentials 프로필(세션 토큰이 있고 만료 전일 때) ③ 설정 s3_profile 프로필(기본 default)의 액세스 키. MFA 기기를 알면 ③ 은 쓰지 않습니다(아래).",
+                "자격증명은 이 순서로 찾습니다: ① 앱이 저장해 둔 세션(설정 폴더의 s3_session.json) ② 설정 s3_session_profile 에 적은 ~/.aws/credentials 프로필(세션 토큰이 있고 만료 전일 때) ③ 설정 s3_profile 프로필(기본 default)의 액세스 키. ①② 가 둘 다 유효하면 만료가 더 늦은 쪽을 씁니다. ① 은 지금 s3_profile 의 액세스 키로 받은 세션일 때만 씁니다(프로필을 바꾸면 다시 MFA 갱신). MFA 기기를 알면 ③ 은 쓰지 않습니다(아래).",
                 "MFA: ~/.aws/config 의 s3_profile 프로필에 mfa_serial 이 있으면 그 기기를, 없으면 설정 s3_mfa_serial 의 기기를 씁니다. S3 를 고르면 버킷 아래 MFA 줄에 세션 상태가 보입니다: '세션 N시간 M분 남음' / '세션 없음 — 코드를 입력하세요' / 'MFA 미설정 (장기 키 사용)' / '자격증명 없음'.",
-                "세션을 받으려면 MFA 앱의 6자리 코드를 넣고 [MFA 갱신] 을 누르거나 Enter 를 칩니다. s3_profile 의 액세스 키로 12시간짜리 세션을 받아 s3_session.json(권한 600)에 저장합니다. 코드는 보내는 즉시 지웁니다. 코드가 틀리면 'MFA 코드가 맞지 않습니다' 가 뜹니다.",
-                "s3_mfa_serial: ~/.aws/config 에도 설정에도 기기가 없을 때만 MFA 줄에 [기기 ARN] 칸이 나타나고, 넣은 값(예: arn:aws:iam::123456789012:mfa/example)은 config.json 의 s3_mfa_serial 로 저장됩니다. 잘못 넣었으면 config.json 에서 고치거나 지우세요.",
+                "세션을 받으려면 MFA 앱의 6자리 코드를 넣고 [MFA 갱신] 을 누르거나 Enter 를 칩니다. s3_profile 의 액세스 키로 12시간짜리 세션을 받아 s3_session.json(권한 600)에 저장합니다. 코드는 보내는 즉시 지웁니다. 코드가 틀리면 'MFA 코드가 맞지 않습니다' 가 뜹니다. s3_profile 프로필에 aws_session_token 이 있으면(임시 자격증명) 세션을 받지 않고 장기 키 프로필을 지정하라고 안내합니다.",
+                "s3_mfa_serial: ~/.aws/config 에도 설정에도 기기가 없을 때만 MFA 줄에 [기기 ARN] 칸이 나타나고, 넣은 값(예: arn:aws:iam::123456789012:mfa/example)은 config.json 의 s3_mfa_serial 로 저장됩니다. 설정에서 온 기기는 MFA 줄의 [기기 변경] 을 눌러 다시 입력할 수 있습니다(~/.aws/config 에서 온 기기는 그 파일에서 고치세요).",
                 "MFA 기기를 아는데 유효한 세션이 없으면 [다운로드] 를 눌러도 시작하지 않고 'MFA 코드를 입력해 세션을 갱신하세요' 를 보여줍니다(장기 키로 대신 받다가 403 이 나지 않도록). 기기를 모르면 MFA 없이 장기 키로 받습니다.",
-                "받는 도중 서명 주소가 만료돼 거부(403)되면 새 주소를 받아 그 지점부터 이어 받습니다(분할 구간 포함, 한 번 받을 때 최대 3번). 세션까지 끝나 새 주소를 받을 수 없으면 그 항목은 일시정지되고 'MFA 세션이 만료됐습니다…' 가 표시됩니다. 받은 만큼은 남아 있으니 세션을 갱신한 뒤 [이어받기] 를 누르세요.",
+                "받는 도중 서명 주소가 만료돼 거부(403)되면 새 주소를 받아 그 지점부터 이어 받습니다(분할 구간 포함, 한 번 받을 때 최대 3번). 세션까지 끝나 새 주소를 받을 수 없으면 그 항목은 일시정지되고 'MFA 세션이 만료됐습니다…' 가 표시됩니다. 받은 만큼은 남아 있으니 세션을 갱신한 뒤 [이어받기] 를 누르세요. MFA 만료가 아닌 이유(자격증명 없음, 리전 확인 실패 등)로 새 주소를 받지 못하면 처음 시작할 때와 같이 실패로 표시되지만, 받은 만큼은 남아 있어 [실패·일시정지 다시 받기] 로 이어받습니다.",
                 "~/.aws/credentials · ~/.aws/config 는 읽기만 하고 고치지 않습니다. 앱이 쓰는 것은 설정 폴더의 s3_session.json 뿐입니다.",
                 "s3_profile / s3_session_profile 은 설정 파일(config.json)에서 바꿉니다. 예: \"s3_profile\": \"example\", \"s3_session_profile\": \"example-session\". s3_session_profile 은 없어도 됩니다.",
                 "받기를 시작하거나 이어받을 때마다 임시 서명 주소를 새로 만듭니다(최대 12시간, 자격증명이 그보다 먼저 만료되면 그때까지). 목록과 .meta 에는 s3://버킷/경로 만 남고 서명 주소·키는 남기지 않습니다.",
@@ -1608,6 +1613,11 @@ impl App {
         let prepared = match (self.mfa_info.serial.clone(), long_term, files.session) {
             (None, ..) => Err("MFA 기기 ARN 을 먼저 입력하세요".to_string()),
             (_, None, _) => Err(format!("장기 키를 찾을 수 없습니다 (~/.aws/credentials 의 s3_profile '{}' 프로필)", self.s3_profile)),
+            // 세션 토큰이 든 프로필로는 GetSessionToken 을 부를 수 없다 (STS 에 보내기 전에 막는다)
+            (_, Some(long), _) if long.session_token.is_some() => Err(format!(
+                "s3_profile '{}' 프로필은 임시 자격증명(세션 토큰 포함)입니다. 장기 키 프로필을 s3_profile 로 지정하세요",
+                self.s3_profile
+            )),
             (_, _, None) => Err("세션을 저장할 폴더를 찾을 수 없습니다 (HOME)".to_string()),
             (Some(serial), Some(long), Some(path)) => Ok((serial, long, path)),
         };
@@ -1625,7 +1635,7 @@ impl App {
             let result = s3::get_session_token(&long, &serial, &code, MFA_SESSION_SECS, s3::now_unix(), endpoint.as_deref());
             wipe(code);
             let next = match result {
-                Ok(creds) => match s3::save_session(&path, &creds) {
+                Ok(creds) => match s3::save_session(&path, &creds, &long.access_key) {
                     Ok(()) => MfaJob::Done,
                     Err(e) => MfaJob::Error(format!("세션 저장 실패: {e}")),
                 },
@@ -1649,7 +1659,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("MFA");
             ui.colored_label(tone(ui, t), text).on_hover_text(
-                "세션은 ① 앱이 저장한 세션(s3_session.json) ② s3_session_profile 프로필 순으로 찾습니다.\n\
+                "세션은 ① 앱이 저장한 세션(s3_session.json) ② s3_session_profile 프로필 순으로 찾습니다(둘 다 유효하면 만료가 늦은 쪽).\n\
                  MFA 기기를 아는데 세션이 없으면 S3 다운로드를 시작하지 않습니다.",
             );
             ui.separator();
@@ -1686,19 +1696,32 @@ impl App {
             if let MfaJob::Error(e) = &job {
                 ui.colored_label(tone(ui, Tone::Bad), e);
             }
-            // 기기를 모를 때만 ARN 칸을 보인다. 입력하는 동안에는 기기를 알게 돼도 칸을 유지한다
+            // 기기를 모를 때만 ARN 칸을 보인다. 입력하는 동안에는 기기를 알게 돼도 칸을 유지한다.
+            // 설정 파일에서 온 기기는 [기기 변경] 으로 칸을 다시 연다 (~/.aws/config 에서 온 기기는 칸·버튼 없음)
             let arn_id = egui::Id::new("mfa_serial");
-            let editing = ui.memory(|m| m.has_focus(arn_id));
-            if !self.mfa_info.serial_in_aws_config && (self.s3_mfa_serial.trim().is_empty() || editing) {
-                ui.label("기기 ARN");
-                let arn = ui.add(
-                    egui::TextEdit::singleline(&mut self.s3_mfa_serial)
-                        .id(arn_id)
-                        .hint_text("arn:aws:iam::123456789012:mfa/example")
-                        .desired_width(260.0),
-                );
-                if arn.changed() {
-                    self.reload_mfa_info();
+            let editing = self.mfa_serial_edit || ui.memory(|m| m.has_focus(arn_id));
+            match serial_ui(self.mfa_info.serial_in_aws_config, &self.s3_mfa_serial, editing) {
+                SerialUi::Hidden => {}
+                SerialUi::ChangeButton => {
+                    if ui.small_button("기기 변경").on_hover_text("설정 파일의 MFA 기기 ARN 을 다시 입력합니다").clicked() {
+                        self.mfa_serial_edit = true;
+                        ui.memory_mut(|m| m.request_focus(arn_id));
+                    }
+                }
+                SerialUi::Field => {
+                    ui.label("기기 ARN");
+                    let arn = ui.add(
+                        egui::TextEdit::singleline(&mut self.s3_mfa_serial)
+                            .id(arn_id)
+                            .hint_text("arn:aws:iam::123456789012:mfa/example")
+                            .desired_width(260.0),
+                    );
+                    if arn.changed() {
+                        self.reload_mfa_info();
+                    }
+                    if arn.lost_focus() {
+                        self.mfa_serial_edit = false;
+                    }
                 }
             }
         });
@@ -1769,7 +1792,7 @@ impl MfaInfo {
             serial_in_aws_config: from_config.is_some(),
             serial: from_config.or(setting),
             long_term: creds.as_deref().and_then(|t| long_term_creds(t, profile, now)).is_some(),
-            session: session_creds(files.session.as_deref(), creds.as_deref(), session_profile, now).map(|(c, s)| (s, c.expires_at)),
+            session: session_creds(files.session.as_deref(), creds.as_deref(), session_profile, profile, now).map(|(c, s)| (s, c.expires_at)),
         }
     }
 
@@ -1790,6 +1813,25 @@ impl MfaInfo {
     /// 기기를 아는데 유효 세션이 없으면 S3 다운로드를 시작하지 않는다
     fn blocks_start(&self, now: u64) -> bool {
         self.serial.is_some() && self.valid_session(now).is_none()
+    }
+}
+
+/// MFA 줄의 기기 ARN 자리에 무엇을 보일지
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SerialUi {
+    /// ~/.aws/config 에서 온 기기: 칸도 버튼도 없다
+    Hidden,
+    /// 입력 칸 (설정에도 없거나, 고치는 중)
+    Field,
+    /// 설정 파일(s3_mfa_serial)에서 온 기기: [기기 변경] 버튼
+    ChangeButton,
+}
+
+fn serial_ui(in_aws_config: bool, setting: &str, editing: bool) -> SerialUi {
+    match (in_aws_config, setting.trim().is_empty() || editing) {
+        (true, _) => SerialUi::Hidden,
+        (false, true) => SerialUi::Field,
+        (false, false) => SerialUi::ChangeButton,
     }
 }
 
@@ -1844,7 +1886,7 @@ impl S3Config {
         let text = read_text(self.credentials_file.as_deref());
         let mfa = read_text(self.aws_config_file.as_deref()).and_then(|t| s3::parse_mfa_serial(&t, &self.profile)).or(self.mfa_serial.clone());
         let creds = if mfa.is_some() {
-            session_creds(self.session_cache.as_deref(), text.as_deref(), self.session_profile.as_deref(), now)
+            session_creds(self.session_cache.as_deref(), text.as_deref(), self.session_profile.as_deref(), &self.profile, now)
                 .map(|(c, _)| c)
                 .ok_or(MFA_EXPIRED)?
         } else {
@@ -1866,23 +1908,37 @@ impl S3Config {
     }
 }
 
-/// 자격증명 찾는 순서: ① 앱 세션 캐시(s3_session.json, 남은 시간 60초 이상)
+/// 자격증명 찾는 순서: ① 앱 세션 캐시(s3_session.json, 남은 시간 60초 이상, `profile` 의 장기 키가 발급한 것)
 /// ② `session_profile` 프로필의 세션 토큰(만료 전. 만료 시각이 적혀 있지 않으면 판단할 수 없어 쓴다)
+/// ①② 가 둘 다 유효하면 만료가 더 늦은 쪽(②의 만료 시각을 모르면 ①)
 /// ③ `profile` 프로필의 키(만료 시각이 적혀 있고 지났으면 쓰지 않는다)
 fn resolve_creds(session_cache: Option<&Path>, credentials: Option<&str>, session_profile: Option<&str>, profile: &str, now: u64) -> Option<s3::Creds> {
-    if let Some((c, _)) = session_creds(session_cache, credentials, session_profile, now) {
+    if let Some((c, _)) = session_creds(session_cache, credentials, session_profile, profile, now) {
         return Some(c);
     }
     long_term_creds(credentials?, profile, now)
 }
 
-/// ①② 세션만 (MFA 기기를 알 때는 이것만 쓴다)
-fn session_creds(session_cache: Option<&Path>, credentials: Option<&str>, session_profile: Option<&str>, now: u64) -> Option<(s3::Creds, SessionSource)> {
-    if let Some(c) = session_cache.and_then(|p| s3::load_session(p, now)) {
-        return Some((c, SessionSource::App));
+/// ①② 세션만 (MFA 기기를 알 때는 이것만 쓴다). 앱 세션은 지금 `profile` 장기 키의 ID 로 발급한 것만 쓴다
+fn session_creds(
+    session_cache: Option<&Path>,
+    credentials: Option<&str>,
+    session_profile: Option<&str>,
+    profile: &str,
+    now: u64,
+) -> Option<(s3::Creds, SessionSource)> {
+    let owner = credentials.and_then(|t| s3::parse_credentials(t, profile)).map(|c| c.access_key);
+    let app = owner.and_then(|o| s3::load_session(session_cache?, &o, now));
+    let prof = credentials
+        .zip(session_profile)
+        .and_then(|(t, sp)| s3::parse_credentials(t, sp))
+        .filter(|c| c.session_token.is_some() && fresh(c, now));
+    match (app, prof) {
+        (Some(a), Some(p)) if p.expires_at.is_some_and(|pe| a.expires_at.is_some_and(|ae| pe > ae)) => Some((p, SessionSource::Profile)),
+        (Some(a), _) => Some((a, SessionSource::App)),
+        (None, Some(p)) => Some((p, SessionSource::Profile)),
+        (None, None) => None,
     }
-    let c = s3::parse_credentials(credentials?, session_profile?).filter(|c| c.session_token.is_some() && fresh(c, now))?;
-    Some((c, SessionSource::Profile))
 }
 
 /// ③ `profile` 프로필의 키 (만료 시각이 적혀 있고 지났으면 쓰지 않는다)
@@ -1906,30 +1962,43 @@ fn s3_parts(id: &str) -> Option<(&str, &str)> {
 }
 
 /// S3 모드 입력 → 항목. 줄에 s3://버킷/ 이 있으면 그 버킷, 없으면 `bucket` 칸.
-/// 둘 다 없는 줄이 있으면 시작하지 않도록 Err(안내 문구)
+/// 둘 다 없는 줄, 또는 키에 `.`/`..` 경로 조각이 있는 줄(HTTP 클라이언트가 주소를 정규화해 서명이 깨진다)이 있으면
+/// 시작하지 않도록 Err(안내 문구)
 fn parse_s3_input(input: &str, bucket: &str) -> Result<Vec<Entry>, String> {
     // 버킷 칸에 s3://버킷/ 처럼 붙여넣어도 받아 준다
     let field = bucket.trim().trim_start_matches("s3://").trim_end_matches('/');
     let mut out = Vec::new();
-    let mut missing = Vec::new();
+    let (mut dots, mut missing) = (Vec::new(), Vec::new());
     for (i, l) in input.lines().enumerate() {
         let Some(p) = s3::parse_s3_line(l) else { continue };
+        if p.key.split('/').any(|seg| seg == "." || seg == "..") {
+            dots.push(i + 1);
+            continue;
+        }
         let b = p.bucket.as_deref().unwrap_or(field);
         if b.is_empty() {
-            missing.push((i + 1).to_string());
+            missing.push(i + 1);
             continue;
         }
         out.push(Entry { line: i + 1, url: format!("s3://{b}/{}", p.key), name: p.name });
     }
-    if missing.is_empty() {
-        return Ok(out);
+    let lines = |v: &[usize]| {
+        let more = if v.len() > 3 { " 외" } else { "" };
+        let shown: Vec<String> = v.iter().take(3).map(usize::to_string).collect();
+        format!("{}번째 줄{more}", shown.join(", "))
+    };
+    let mut errs = Vec::new();
+    if !dots.is_empty() {
+        errs.push(format!("경로에 . 또는 .. 조각이 있어 받을 수 없습니다 ({})", lines(&dots)));
     }
-    let more = if missing.len() > 3 { " 외" } else { "" };
-    missing.truncate(3);
-    Err(format!(
-        "버킷 칸이 비어 있습니다. 버킷을 입력하거나 s3://버킷/경로 로 쓰세요 ({}번째 줄{more})",
-        missing.join(", ")
-    ))
+    if !missing.is_empty() {
+        errs.push(format!("버킷 칸이 비어 있습니다. 버킷을 입력하거나 s3://버킷/경로 로 쓰세요 ({})", lines(&missing)));
+    }
+    if errs.is_empty() {
+        Ok(out)
+    } else {
+        Err(errs.join(" / "))
+    }
 }
 
 /// idxs 를 대기 상태로 큐에 넣는다. 항목마다 세대 번호를 올리므로 큐에 남아 있던 옛 작업은 워커가 건너뛴다.
@@ -2233,8 +2302,7 @@ fn download(shared: Shared, idx: usize, segments: usize) {
             // MFA 세션이 없어 발급하지 못하면 실패가 아니라 일시정지(안내)로 둔다.
             // 오류 문구에 서명 주소가 섞이지 않도록 식별자로 바꿔 둔다
             Some(p) => match p(&url) {
-                Err(e) if e == MFA_EXPIRED => Err(format!("{REISSUE_FAILED}{e}")),
-                Err(e) => Err(e),
+                Err(e) => Err(issue_error(e)),
                 Ok(fetch) => {
                     download_file(&Source::signed(&url, fetch, p), &dest, segments, &stop, &set).map_err(|e| hide_fetch_url(e, &url))
                 }
@@ -2266,27 +2334,46 @@ fn download(shared: Shared, idx: usize, segments: usize) {
                 items[idx].note = Some(why.to_string());
             }
         }
+        // 발급 오류(MFA 만료 외)도 여기: 받던 .part/.meta 는 지우지 않으므로 다시 받으면 이어받는다
         Err(e) => {
             let mut items = shared.lock().unwrap();
-            items[idx].status = Status::Failed(e);
+            items[idx].status = Status::Failed(e.strip_prefix(ISSUE_ERROR).unwrap_or(&e).to_string());
             items[idx].selected = true;
         }
     }
 }
 
-/// 오류 문구 안의 http(s) 주소(presigned 서명·토큰 포함)를 식별자로 바꾼다
-fn hide_fetch_url(mut msg: String, id: &str) -> String {
-    while let Some(p) = msg.find("https://").or_else(|| msg.find("http://")) {
-        let end = msg[p..].find(|c: char| c.is_whitespace() || c == ')').map_or(msg.len(), |n| p + n);
-        msg.replace_range(p..end, id);
+/// 요청 주소 발급 오류 → 내부 표시. 처음 발급·도중 재발급 모두 같은 규칙:
+/// MFA 세션 만료·없음(MFA_EXPIRED)만 일시정지(REISSUE_FAILED), 그 외(자격증명 없음·리전 조회 실패 등)는 오류 상태(ISSUE_ERROR)
+fn issue_error(e: String) -> String {
+    if e == MFA_EXPIRED {
+        format!("{REISSUE_FAILED}{e}")
+    } else {
+        format!("{ISSUE_ERROR}{e}")
     }
-    msg
+}
+
+/// 오류 문구 안의 http(s) 주소(presigned 서명·토큰 포함)를 식별자로 바꾼다.
+/// 바꿔 넣은 식별자(키에 `https://` 가 들어 있을 수 있다)는 다시 보지 않도록 바꾼 자리 뒤부터 찾는다
+fn hide_fetch_url(msg: String, id: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg.as_str();
+    while let Some(p) = [rest.find("https://"), rest.find("http://")].into_iter().flatten().min() {
+        out.push_str(&rest[..p]);
+        out.push_str(id);
+        let tail = &rest[p..];
+        rest = &tail[tail.find(|c: char| c.is_whitespace() || c == ')').unwrap_or(tail.len())..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 다운로드 한 번(시작·재개)에서 403 으로 요청 주소를 다시 발급하는 최대 횟수
 const MAX_REISSUE: usize = 3;
 /// 요청 주소를 다시 발급하지 못해 멈췄음을 나타내는 오류 접두사 (뒤에 사유). 실패가 아니라 일시정지로 바뀐다
 const REISSUE_FAILED: &str = "\u{0}reissue:";
+/// 요청 주소 발급이 MFA 만료 외의 이유로 실패했음을 나타내는 오류 접두사 (뒤에 사유). 구간 재시도 없이 오류 상태로 바뀐다
+const ISSUE_ERROR: &str = "\u{0}issue:";
 
 /// 요청 주소. URL 항목은 고정이고, S3 항목은 403/400 을 받으면 발급기로 새 주소를 받아 같은 범위를 다시 요청한다
 struct Source<'a> {
@@ -2299,7 +2386,7 @@ struct Source<'a> {
 struct SourceState {
     url: String,
     reissued: usize,
-    /// 재발급이 한 번 실패하면 그 사유. 다른 구간이 발급기를 다시 부르지 않는다
+    /// 재발급이 한 번 실패하면 그 오류(issue_error 로 표시한 것). 다른 구간이 발급기를 다시 부르지 않는다
     failed: Option<String>,
 }
 
@@ -2317,13 +2404,14 @@ impl<'a> Source<'a> {
     }
 
     /// `used` 로 보낸 요청이 거부됐을 때 다음에 쓸 주소. 다른 구간이 이미 새로 받았으면 그 주소를 쓴다(구간이 여럿이어도 한 번만 발급).
-    /// URL 항목이거나 상한(MAX_REISSUE)을 넘었으면 None(거부 응답을 그대로 쓴다), 발급기가 실패하면 Err(REISSUE_FAILED + 사유)
+    /// URL 항목이거나 상한(MAX_REISSUE)을 넘었으면 None(거부 응답을 그대로 쓴다),
+    /// 발급기가 실패하면 Err(issue_error: MFA 만료는 REISSUE_FAILED, 그 외는 ISSUE_ERROR + 사유)
     fn reissue(&self, used: &str) -> Result<Option<String>, String> {
         let Some(presign) = self.presign else { return Ok(None) };
         // 발급하는 동안 잠가 둔다: 같이 거부된 다른 구간은 기다렸다가 새 주소를 받아 간다
         let mut st = self.state.lock().unwrap();
-        if let Some(why) = &st.failed {
-            return Err(format!("{REISSUE_FAILED}{why}"));
+        if let Some(e) = &st.failed {
+            return Err(e.clone());
         }
         if st.url != used {
             return Ok(Some(st.url.clone()));
@@ -2338,9 +2426,9 @@ impl<'a> Source<'a> {
                 Ok(Some(url))
             }
             Err(e) => {
-                let msg = format!("{REISSUE_FAILED}{e}");
-                st.failed = Some(e);
-                Err(msg)
+                let e = issue_error(e);
+                st.failed = Some(e.clone());
+                Err(e)
             }
         }
     }
@@ -2542,11 +2630,11 @@ fn download_ranged(
     });
     if !errors.is_empty() {
         let _ = save();
-        // 멈춤 신호가 원인이면 그걸 우선 보고한다 (다른 구간의 '연결 끊김' 보다). 다음은 재발급 실패(일시정지로 바뀐다)
+        // 멈춤 신호가 원인이면 그걸 우선 보고한다 (다른 구간의 '연결 끊김' 보다). 다음은 재발급 실패(일시정지 또는 오류 상태)
         let e = errors
             .iter()
             .find(|e| *e == STOPPED)
-            .or_else(|| errors.iter().find(|e| e.starts_with(REISSUE_FAILED)))
+            .or_else(|| errors.iter().find(|e| e.starts_with(REISSUE_FAILED) || e.starts_with(ISSUE_ERROR)))
             .unwrap_or(&errors[0])
             .clone();
         return Err(e);
@@ -2577,8 +2665,8 @@ fn fetch_segment(client: &Client, src: &Source, file: &File, seg: &Seg, stop: &A
         }
         match fetch_once(client, src, file, seg, stop, tick) {
             Ok(()) => return Ok(()),
-            // 재발급 실패는 기다려도 풀리지 않는다 (세션을 갱신해야 한다)
-            Err(e) if e == STOPPED || e.starts_with(REISSUE_FAILED) => return Err(e),
+            // 재발급 실패는 기다려도 풀리지 않는다 (세션 갱신·설정 수정이 필요하다)
+            Err(e) if e == STOPPED || e.starts_with(REISSUE_FAILED) || e.starts_with(ISSUE_ERROR) => return Err(e),
             Err(e) => last_err = e,
         }
     }
@@ -3834,6 +3922,60 @@ mod s3_tests {
         );
     }
 
+    // 키에 http(s):// 가 들어 있어도 바꿔 넣은 식별자를 다시 바꾸지 않고 끝난다
+    #[test]
+    fn hide_fetch_url_terminates_when_id_contains_url() {
+        const LOOPY: &str = "s3://example-bucket/mirror/https://example.com/a.zip";
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let msgs = [
+                "error sending request for url (https://h/mirror/https%3A//example.com/a.zip?X-Amz-Signature=s&X-Amz-Security-Token=TOPSECRETTOKEN): refused",
+                "a http://h/x?X-Amz-Signature=s b https://h/y?X-Amz-Signature=t c",
+                "https://h/z?X-Amz-Signature=u",
+            ];
+            let _ = tx.send(msgs.iter().map(|m| hide_fetch_url(m.to_string(), LOOPY)).collect::<Vec<_>>());
+        });
+        let out = rx.recv_timeout(Duration::from_secs(5)).expect("hide_fetch_url 이 끝나지 않는다 (무한 루프)");
+        assert_eq!(out[0], format!("error sending request for url ({LOOPY}): refused"));
+        assert_eq!(out[1], format!("a {LOOPY} b {LOOPY} c"));
+        assert_eq!(out[2], LOOPY);
+        assert!(out.iter().all(|m| !m.contains("X-Amz-Signature") && !m.contains("TOPSECRETTOKEN")), "{out:?}");
+
+        // 실제 다운로드 경로에서도 끝나고 서명 쿼리가 남지 않는다
+        let dir = tmp("hide_loop");
+        let p: Presign = Arc::new(|_: &str| Ok("http://127.0.0.1:1/mirror/https%3A//example.com/a.zip?X-Amz-Signature=abc".into()));
+        let mut it = Item::new(1, LOOPY.into(), "a.zip".into(), dir.clone());
+        it.presign = Some(p);
+        let shared: Shared = Arc::new(Mutex::new(vec![it]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = Arc::clone(&shared);
+        thread::spawn(move || {
+            download(s, 0, 4);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(30)).expect("download 이 끝나지 않는다");
+        let Status::Failed(e) = shared.lock().unwrap()[0].status.clone() else { panic!("실패여야 한다") };
+        assert!(!e.contains("X-Amz-Signature") && e.contains(LOOPY), "{e}");
+    }
+
+    // `.`/`..` 경로 조각이 있는 키는 HTTP 클라이언트가 주소를 정규화해 서명이 깨지므로 시작하지 않고 몇 번째 줄인지 알린다
+    #[test]
+    fn s3_input_rejects_dot_segments() {
+        for key in ["a/../b.zip", "./a.zip", "a/./b.zip", "a/..", "s3://example-bucket/../a.zip"] {
+            let err = parse_s3_input(&format!("ok.zip\n{key}"), "example-bucket").unwrap_err();
+            assert!(err.contains("2번째 줄") && err.contains(".."), "{key}: {err}");
+        }
+        // 여러 줄이면 앞 셋 + 외
+        let err = parse_s3_input("./a\n./b\nok.zip\n./c\n./d", "example-bucket").unwrap_err();
+        assert!(err.contains("1, 2, 4번째 줄 외"), "{err}");
+        // 점이 이름의 일부인 조각은 괜찮다
+        let ok = parse_s3_input("a/..b/c.zip\n.hidden/x.zip\na/b../c\n...", "example-bucket").unwrap();
+        assert_eq!(ok.len(), 4);
+        // 버킷 누락과 함께 있으면 둘 다 알린다
+        let err = parse_s3_input("./a.zip\nb.zip", "").unwrap_err();
+        assert!(err.contains("1번째 줄") && err.contains("버킷") && err.contains("2번째 줄"), "{err}");
+    }
+
     // (iv) S3 입력 해석 → 식별자·저장 파일명
     #[test]
     fn s3_input_parsing_and_names() {
@@ -3915,18 +4057,34 @@ mod s3_tests {
         assert_eq!(r(None, "default").as_deref(), Some("AKIADEFAULT"));
         assert_eq!(r(None, "missing"), None);
         assert_eq!(key(resolve_creds(Some(&cache), None, None, "default", now)), None);
-        // 앱 세션 캐시가 유효하면 가장 먼저
+        // 앱 세션 캐시가 유효하면 장기 키보다 먼저
         let cached = s3::Creds {
             access_key: "ASIACACHE".into(),
             secret_key: "test-secret".into(),
             session_token: Some("test-token".into()),
             expires_at: Some(now + 3600),
         };
-        s3::save_session(&cache, &cached).unwrap();
+        s3::save_session(&cache, &cached, "AKIADEFAULT").unwrap();
+        assert_eq!(r(None, "default").as_deref(), Some("ASIACACHE"));
+        assert_eq!(r(Some("stale-session"), "default").as_deref(), Some("ASIACACHE"));
+        // 앱 세션과 세션 프로필이 둘 다 유효하면 만료가 더 늦은 쪽 (example-session 은 2027-06-01 까지)
+        assert_eq!(r(Some("example-session"), "default").as_deref(), Some("ASIASESSION"));
+        let later = s3::Creds { expires_at: Some(s3::parse_iso8601("2027-07-01T00:00:00Z").unwrap()), ..cached.clone() };
+        s3::save_session(&cache, &later, "AKIADEFAULT").unwrap();
         assert_eq!(r(Some("example-session"), "default").as_deref(), Some("ASIACACHE"));
-        assert_eq!(key(resolve_creds(Some(&cache), None, None, "default", now)).as_deref(), Some("ASIACACHE"));
+        // 만료 시각이 적혀 있지 않은 프로필 세션보다는 만료 시각을 아는 앱 세션
+        let no_exp = text.replace("aws_session_expiration = 2027-06-01T00:00:00Z\n", "");
+        assert_eq!(key(resolve_creds(Some(&cache), Some(&no_exp), Some("example-session"), "default", now)).as_deref(), Some("ASIACACHE"));
+        s3::save_session(&cache, &cached, "AKIADEFAULT").unwrap();
+        // 세션 주인(장기 키 ID)이 지금 s3_profile 의 키와 다르면 쓰지 않는다: no-token 프로필로 바꾸면 그 키로
+        assert_eq!(r(None, "no-token").as_deref(), Some("AKIANOTOKEN"));
+        // 장기 키를 알 수 없으면(자격증명 파일 없음) 앱 세션의 주인을 확인할 수 없어 쓰지 않는다
+        assert_eq!(key(resolve_creds(Some(&cache), None, None, "default", now)), None);
         // 캐시가 만료됐으면 다음 순서로
         assert_eq!(key(resolve_creds(Some(&cache), Some(&text), None, "default", now + 3600)).as_deref(), Some("AKIADEFAULT"));
+        // 주인 정보가 없는 옛 세션 파일은 무효
+        std::fs::write(&cache, format!(r#"{{"access_key":"ASIACACHE","secret_key":"s","session_token":"t","expires_at":{}}}"#, now + 3600)).unwrap();
+        assert_eq!(r(None, "default").as_deref(), Some("AKIADEFAULT"));
 
         // presign 유효 시간: 12시간과 남은 시간 중 짧은 쪽
         assert_eq!(presign_secs(&cached, now), 3600);
@@ -4119,7 +4277,7 @@ mod mfa_tests {
 
         let path = dir.join("s3_session.json");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        let saved = s3::load_session(&path, now).expect("세션 저장");
+        let saved = s3::load_session(&path, "AKIAEXAMPLE", now).expect("세션 저장");
         assert_eq!(saved.access_key, "ASIAEXAMPLE");
         assert_eq!(app.mfa_info.status(now), MfaStatus::Valid { source: SessionSource::App, left: Some(MFA_SESSION_SECS) });
         assert_eq!(mfa_status_text(&app.mfa_info.status(now)).0, "세션 12시간 0분 남음");
@@ -4196,7 +4354,7 @@ mod mfa_tests {
             session_token: Some("test-token".into()),
             expires_at: Some(now + 3600),
         };
-        s3::save_session(&dir.join("s3_session.json"), &session).unwrap();
+        s3::save_session(&dir.join("s3_session.json"), &session, "AKIAEXAMPLE").unwrap();
         assert!(!app.mfa_blocks_start(&entries));
 
         // 기기 번호는 config.json 의 s3_mfa_serial 로도 안다 (~/.aws/config 에 없을 때)
@@ -4417,6 +4575,87 @@ mod mfa_tests {
         assert!(matches!(items[0].status, Status::Paused { .. }));
         assert_eq!(items[0].note.as_deref(), Some(MFA_EXPIRED));
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+    }
+
+    // 도중 재발급이 MFA 만료가 아닌 이유(자격증명 없음·리전 조회 실패 등)로 실패하면 처음 발급과 같은 규칙으로 오류 상태.
+    // 단 부분 파일·메타는 남겨 [실패·일시정지 다시 받기] 로 이어받는다
+    #[test]
+    fn s3_reissue_other_error_fails_but_keeps_partial() {
+        let data = data();
+        let (base, _) = serve_signed(Arc::clone(&data), expire_mid_download);
+        let dir = tmp("reissue_err");
+        let allow = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (b, a, c) = (base.clone(), Arc::clone(&allow), Arc::clone(&calls));
+        let p: Presign = Arc::new(move |id: &str| {
+            assert_eq!(id, ID);
+            let n = c.fetch_add(1, SeqCst);
+            if n > 0 && !a.load(SeqCst) {
+                return Err("버킷 리전 확인 실패: HTTP 500".to_string());
+            }
+            Ok(format!("{b}?X-Amz-Signature=sig{n}&X-Amz-Security-Token=TOPSECRETTOKEN"))
+        });
+        let shared = s3_item(&dir, p);
+        let started = Instant::now();
+        download(Arc::clone(&shared), 0, 4);
+        {
+            let items = shared.lock().unwrap();
+            let Status::Failed(e) = &items[0].status else { panic!("오류 상태여야 한다") };
+            assert_eq!(e, "버킷 리전 확인 실패: HTTP 500");
+            assert!(items[0].selected, "실패는 자동 선택");
+            assert_eq!(items[0].note, None);
+        }
+        assert_eq!(calls.load(SeqCst), 2, "재발급 실패는 구간 재시도로 다시 부르지 않는다");
+        assert!(started.elapsed() < Duration::from_millis(3500), "재발급 실패는 구간 재시도(2초 대기)를 되풀이하지 않는다");
+        assert!(dir.join("big.bin.part").exists(), "부분 파일 보존");
+        let meta = load_meta(&dir.join("big.bin.meta"), ID).expect("메타 보존");
+        assert!(meta.segs.iter().any(|(_, _, d)| *d > 0));
+
+        // 원인을 고친 뒤 다시 받기 → 이어받아 완료
+        allow.store(true, SeqCst);
+        let (queue, active): (Queue, _) = (Default::default(), Arc::new(AtomicUsize::new(0)));
+        enqueue_jobs(&shared, &queue, &active, &[0], 1, 4);
+        wait_settled(&shared);
+        assert!(matches!(shared.lock().unwrap()[0].status, Status::Finished));
+        assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), *data);
+
+        // 처음 발급도 같은 규칙: MFA 만료가 아닌 이유는 오류 상태 (MFA 만료는 위 테스트처럼 일시정지)
+        let dir = tmp("issue_err_start");
+        let p: Presign = Arc::new(|_: &str| Err("버킷 리전 확인 실패: HTTP 500".to_string()));
+        let shared = s3_item(&dir, p);
+        download(Arc::clone(&shared), 0, 4);
+        assert!(matches!(&shared.lock().unwrap()[0].status, Status::Failed(e) if e == "버킷 리전 확인 실패: HTTP 500"));
+    }
+
+    // s3_profile 프로필에 세션 토큰이 있으면(임시 자격증명) STS 에 보내지 않고 안내한다
+    #[test]
+    fn mfa_refresh_refuses_temporary_long_term_profile() {
+        let dir = tmp("temp_profile");
+        let temp = "[default]\naws_access_key_id = ASIATEMPEXAMPLE\naws_secret_access_key = test-secret\naws_session_token = test-token\n";
+        let (endpoint, req) = fake_sts("200 OK", sts_ok(s3::now_unix() + MFA_SESSION_SECS));
+        let mut app = mfa_app(files(&dir, Some(temp), Some(SERIAL)));
+        app.sts_endpoint = Some(endpoint);
+        app.reload_mfa_info();
+        app.mfa_code = "123456".into();
+        app.refresh_mfa();
+        assert!(app.mfa_code.is_empty());
+        let MfaJob::Error(msg) = wait_job(&app) else { panic!("오류여야 한다") };
+        assert!(msg.contains("임시 자격증명") && msg.contains("s3_profile"), "{msg}");
+        assert!(!msg.contains("123456") && !msg.contains("test-secret") && !msg.contains("test-token"), "{msg}");
+        thread::sleep(Duration::from_millis(200));
+        assert!(req.lock().unwrap().is_empty(), "STS 에 요청하지 않는다");
+        assert!(!dir.join("s3_session.json").exists());
+    }
+
+    // 기기 ARN 칸: AWS 설정에서 온 기기는 칸·버튼 없음, 설정 파일의 기기는 [기기 변경] 버튼, 비었거나 고치는 중이면 칸
+    #[test]
+    fn mfa_serial_field_states() {
+        assert_eq!(serial_ui(true, "", false), SerialUi::Hidden);
+        assert_eq!(serial_ui(true, SERIAL, true), SerialUi::Hidden);
+        assert_eq!(serial_ui(false, "", false), SerialUi::Field);
+        assert_eq!(serial_ui(false, "  ", false), SerialUi::Field);
+        assert_eq!(serial_ui(false, SERIAL, false), SerialUi::ChangeButton);
+        assert_eq!(serial_ui(false, SERIAL, true), SerialUi::Field);
     }
 
     // (vi) MFA 줄 상태 글자: 남은 시간 포맷과 각 경우. 파일에서 기기 번호·세션을 읽는 순서
