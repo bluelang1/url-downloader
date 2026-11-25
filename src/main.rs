@@ -2,7 +2,7 @@ use eframe::egui;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderName, CONTENT_RANGE, ETAG, RANGE};
 use reqwest::StatusCode;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// TODO(2단계): 화면·다운로드 엔진에 연결하면 allow 를 뗀다
+// TODO(2b): MFA 세션 발급(get_session_token·save_session·parse_mfa_serial)을 화면에 연결하면 allow 를 뗀다
 #[allow(dead_code)]
 mod s3;
 
@@ -46,9 +46,16 @@ const STOPPED: &str = "\u{0}stopped";
 /// 저장할 이름의 파일이 이미 있을 때의 오류
 const EXISTS: &str = "같은 이름의 파일이 이미 있습니다";
 
+/// 식별자(`s3://버킷/키`) → 실제로 요청할 주소(presigned https). 받기를 시작·재개할 때마다 새로 부른다
+type Presign = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
 struct Item {
     line: usize,
+    /// 항목의 안정 식별자. URL 항목은 그 URL, S3 항목은 `s3://버킷/키`.
+    /// 화면 표시·이어받기 기록(.meta)·이름 고르기에 쓴다 (presigned 주소는 여기 두지 않는다)
     url: String,
+    /// S3 항목만: 받을 때마다 식별자로 요청 주소를 발급한다. None 이면 `url` 로 바로 요청
+    presign: Option<Presign>,
     name: String,
     /// 이 항목을 저장하는 폴더 (시작할 때 정해지고 바뀌지 않는다)
     dir: PathBuf,
@@ -68,6 +75,7 @@ impl Item {
         Self {
             line,
             url,
+            presign: None,
             name,
             dir,
             status: Status::Waiting,
@@ -117,6 +125,42 @@ struct App {
     /// 워커 풀: 대기 작업 큐와 지금 돌고 있는 워커 수 (동시 파일 한도를 지킨다)
     queue: Queue,
     active_workers: Arc<AtomicUsize>,
+    /// 입력창을 URL 목록으로 볼지 S3 경로 목록으로 볼지
+    mode: Mode,
+    /// S3 모드의 기본 버킷 (줄에 s3://버킷/ 이 없을 때 쓴다)
+    bucket: String,
+    /// 장기 키를 읽을 ~/.aws/credentials 프로필 (설정 키 s3_profile, 기본 "default")
+    s3_profile: String,
+    /// 세션 토큰을 읽을 프로필 (설정 키 s3_session_profile, 기본 없음)
+    s3_session_profile: Option<String>,
+    /// 버킷 → 리전 (앱이 켜져 있는 동안 기억)
+    s3_regions: Arc<Mutex<HashMap<String, String>>>,
+    /// 테스트용: S3 요청 주소 발급을 바꿔 끼운다. None 이면 실제 자격증명으로 presign
+    presign_override: Option<Presign>,
+}
+
+/// 입력 모드
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Url,
+    S3,
+}
+
+impl Mode {
+    fn key(self) -> &'static str {
+        match self {
+            Mode::Url => "url",
+            Mode::S3 => "s3",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "url" => Some(Mode::Url),
+            "s3" => Some(Mode::S3),
+            _ => None,
+        }
+    }
 }
 
 /// 화면 테마. 메뉴 오른쪽 버튼으로 데이 → 나이트 → 시스템 순으로 바뀐다
@@ -255,6 +299,12 @@ impl Default for App {
             update: Arc::new(Mutex::new(UpdateState::Checking)),
             queue: Default::default(),
             active_workers: Default::default(),
+            mode: Mode::Url,
+            bucket: String::new(),
+            s3_profile: "default".to_string(),
+            s3_session_profile: None,
+            s3_regions: Default::default(),
+            presign_override: None,
         }
     }
 }
@@ -319,6 +369,14 @@ fn main() -> eframe::Result {
                 app.input = text.replace("\\n", "\n").replace("\\t", "\t");
             }
             app.autostart = std::env::var("URL_DOWNLOADER_AUTOSTART").is_ok();
+            // 개발용: 입력 모드·버킷. 설정 파일에 저장된 값으로 치지 않도록 저장 기준(saved_config)도 다시 잡는다
+            if let Some(m) = std::env::var("URL_DOWNLOADER_MODE").ok().as_deref().and_then(Mode::from_key) {
+                app.mode = m;
+            }
+            if let Ok(b) = std::env::var("URL_DOWNLOADER_BUCKET") {
+                app.bucket = b;
+            }
+            app.saved_config = app.config_json();
             app.view = match std::env::var("URL_DOWNLOADER_START_VIEW").as_deref() {
                 Ok("help") => View::Help,
                 Ok("about") => View::About,
@@ -371,8 +429,7 @@ impl eframe::App for App {
         self.accept_dropped_files(ctx);
         self.save_config_if_changed();
         if std::mem::take(&mut self.autostart) {
-            if let Some(dir) = self.folder.clone() {
-                let urls = parse_urls(&self.input);
+            if let (Some(dir), Ok(urls)) = (self.folder.clone(), self.parse_input()) {
                 self.start(urls, dir);
             }
         }
@@ -449,13 +506,39 @@ impl eframe::App for App {
                 self.update_bar(ui);
             });
             ui.add_space(6.0);
+            // 입력 모드: URL | S3. S3 일 때만 버킷 칸이 보인다. 모드를 바꿔도 아래 목록은 그대로 둔다
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("링크 목록 (한 줄에 하나)").strong());
-                ui.label(
-                    egui::RichText::new("형식: URL  또는  파일명<Tab>URL  /  파일명 | URL   (확장자는 원본 그대로)")
-                        .color(tone(ui, Tone::Muted))
-                        .small(),
-                );
+                for (m, label, tip) in [
+                    (Mode::Url, "URL", "http(s) 링크 목록을 받습니다"),
+                    (Mode::S3, "S3", "AWS S3 버킷 안의 경로 목록을 받습니다 (~/.aws/credentials 사용)"),
+                ] {
+                    if ui.selectable_label(self.mode == m, label).on_hover_text(tip).clicked() {
+                        self.mode = m;
+                    }
+                }
+                if self.mode == Mode::S3 {
+                    ui.separator();
+                    ui.label("버킷");
+                    ui.add(egui::TextEdit::singleline(&mut self.bucket).hint_text("example-bucket").desired_width(220.0))
+                        .on_hover_text("줄에 s3://버킷/경로 로 쓰면 그 줄은 이 칸 대신 그 버킷에서 받습니다");
+                }
+            });
+            ui.add_space(4.0);
+            let (list_title, format_hint, input_hint) = match self.mode {
+                Mode::Url => (
+                    "링크 목록 (한 줄에 하나)",
+                    "형식: URL  또는  파일명<Tab>URL  /  파일명 | URL   (확장자는 원본 그대로)",
+                    "https://...  또는  파일명<Tab>https://...",
+                ),
+                Mode::S3 => (
+                    "S3 경로 목록 (한 줄에 하나)",
+                    "형식: 경로  또는  이름<Tab>경로  /  이름 | 경로  /  s3://버킷/경로   (확장자는 원본 그대로)",
+                    "경로/파일.zip  또는  이름 | 경로/파일.zip",
+                ),
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(list_title).strong());
+                ui.label(egui::RichText::new(format_hint).color(tone(ui, Tone::Muted)).small());
             });
             ui.add_space(4.0);
 
@@ -483,7 +566,7 @@ impl eframe::App for App {
                             [ui.available_width(), (line_count.max(8)) as f32 * row_h + 8.0],
                             egui::TextEdit::multiline(&mut self.input)
                                 .font(mono.clone())
-                                .hint_text("https://...  또는  파일명<Tab>https://..."),
+                                .hint_text(input_hint),
                         );
                     });
                 });
@@ -492,14 +575,20 @@ impl eframe::App for App {
             // 끝나지 않은 항목(대기·진행·일시정지)이 있으면 폴더를 못 바꾸고 새로 시작하지도 못한다:
             // 그 항목들은 처음 폴더에 이어서 받고, 새 목록은 이전 목록을 통째로 바꾸기 때문이다
             let unfinished = self.items.lock().unwrap().iter().any(Item::is_unfinished);
+            // S3 모드에서 버킷을 알 수 없는 줄이 있으면 시작하지 않고 이유를 보여준다
+            let (urls, input_error) = match self.parse_input() {
+                Ok(u) => (u, None),
+                Err(e) => (Vec::new(), Some(e)),
+            };
             ui.horizontal(|ui| {
-                let urls = parse_urls(&self.input);
                 let mut btn = ui.add_enabled(
                     !unfinished && !urls.is_empty(),
                     egui::Button::new(format!("다운로드 ({}개)", urls.len())),
                 );
                 if unfinished {
                     btn = btn.on_disabled_hover_text("진행 중이거나 일시정지된 항목이 있습니다. 끝내거나 취소한 뒤 시작하세요");
+                } else if let Some(e) = &input_error {
+                    btn = btn.on_disabled_hover_text(e);
                 }
                 if btn.clicked() {
                     // 기억해 둔 폴더가 있으면 바로 시작, 없으면 고른다
@@ -561,6 +650,9 @@ impl eframe::App for App {
                     }
                 }
             });
+            if let Some(e) = &input_error {
+                ui.colored_label(tone(ui, Tone::Bad), format!("⚠ {e}"));
+            }
 
             ui.add_space(8.0);
             ui.separator();
@@ -766,6 +858,19 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/URL Downloader/config.json"))
 }
 
+/// config.json 과 같은 폴더의 S3 세션 캐시 (2b 의 MFA 세션 발급이 쓴다)
+fn s3_session_path() -> Option<PathBuf> {
+    Some(config_path()?.with_file_name("s3_session.json"))
+}
+
+/// AWS_SHARED_CREDENTIALS_FILE 또는 ~/.aws/credentials
+fn aws_credentials_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("AWS_SHARED_CREDENTIALS_FILE").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".aws/credentials"))
+}
+
 /// macOS 알림 센터에 띄운다 (osascript)
 fn notify(title: &str, msg: &str) {
     let script = format!(
@@ -863,6 +968,24 @@ const HELP: &[Section] = &[
         ],
     },
     Section {
+        title: "S3 다운로드",
+        blocks: &[
+            Text("입력창 위의 [URL | S3] 에서 S3 를 고르면 AWS S3 버킷의 파일을 받습니다. 버킷 칸에 버킷 이름을 넣고, 입력창에는 버킷 안의 경로를 한 줄에 하나씩 씁니다."),
+            Code("reports/2026/summary.pdf\n요약본 | reports/2026/summary.pdf\nreports/2026/summary.pdf<Tab>요약본\ns3://example-bucket/reports/2026/summary.pdf"),
+            Bullets(&[
+                "이름과 경로 사이 구분자는 탭이나 세로줄(|) 뿐입니다. 공백·쉼표는 경로의 일부로 봅니다(예: 'photos/2026 봄, 여행.zip').",
+                "s3://버킷/경로 로 쓴 줄은 버킷 칸 대신 그 버킷에서 받습니다. 버킷 칸이 비어 있으면 모든 줄을 이 형식으로 써야 [다운로드] 가 켜집니다.",
+                "저장 파일명 규칙은 URL 모드와 같습니다. 이름을 주면 이름 + 원본 확장자, 없으면 경로의 마지막 부분입니다. 경로의 %20 같은 글자는 풀지 않고 그대로 씁니다.",
+                "자격증명은 이 순서로 찾습니다: ① 앱이 저장해 둔 세션(설정 폴더의 s3_session.json) ② 설정 s3_session_profile 에 적은 ~/.aws/credentials 프로필(세션 토큰이 있고 만료 전일 때) ③ 설정 s3_profile 프로필(기본 default)의 액세스 키.",
+                "s3_profile / s3_session_profile 은 설정 파일(config.json)에서 바꿉니다. 예: \"s3_profile\": \"example\", \"s3_session_profile\": \"example-session\". s3_session_profile 은 없어도 됩니다.",
+                "받기를 시작하거나 이어받을 때마다 임시 서명 주소를 새로 만듭니다(최대 12시간, 자격증명이 그보다 먼저 만료되면 그때까지). 목록과 .meta 에는 s3://버킷/경로 만 남고 서명 주소·키는 남기지 않습니다.",
+                "일시정지·실패 뒤 이어받기, 앱을 껐다 켠 뒤 같은 경로를 같은 폴더에 다시 받기는 URL 모드와 똑같이 이어집니다.",
+                "자격증명을 찾지 못하면 그 항목이 'AWS 자격증명을 찾을 수 없습니다' 로 실패합니다. ~/.aws/credentials 를 고친 뒤 [실패·일시정지 다시 받기] 를 누르세요.",
+                "URL/S3 선택과 마지막 버킷은 앱을 껐다 켜도 유지됩니다. 모드를 바꿔도 아래 목록은 지워지지 않고, 목록의 항목은 각자 처음 모드대로 이어받습니다.",
+            ]),
+        ],
+    },
+    Section {
         title: "다운로드 설정",
         blocks: &[
             Bullets(&[
@@ -873,7 +996,7 @@ const HELP: &[Section] = &[
                 "저장 폴더: 한 번 고르면 기억해 두고 다음부터는 [다운로드] 를 누르면 바로 그 폴더에 받습니다. 바꾸려면 [변경…] 을 누르세요.",
                 "목록에 끝나지 않은 항목(대기·진행·일시정지)이 있으면 [변경…] 이 꺼집니다. 그 항목들은 처음 고른 폴더에 이어서 받기 때문입니다. 모두 끝나거나 취소하면 다시 켜집니다.",
                 "기억한 폴더가 지금 없으면(외장 드라이브를 뺀 경우 등) [다운로드] 를 누를 때 폴더를 다시 고르게 합니다. 기억한 값은 지우지 않습니다.",
-                "동시 파일·분할 수·저장 폴더·테마는 앱을 껐다 켜도 유지됩니다 (~/Library/Application Support/URL Downloader/config.json).",
+                "동시 파일·분할 수·저장 폴더·테마·URL/S3 모드·버킷은 앱을 껐다 켜도 유지됩니다 (~/Library/Application Support/URL Downloader/config.json).",
             ]),
         ],
     },
@@ -1025,11 +1148,16 @@ impl App {
     }
 
     fn config_json(&self) -> String {
+        // s3_profile·s3_session_profile 은 화면에서 바꾸지 않지만, 파일에 손으로 적은 값이 다음 저장 때 지워지지 않도록 함께 쓴다
         serde_json::json!({
             "folder": self.folder.as_ref().map(|p| p.display().to_string()),
             "concurrent": self.concurrent,
             "segments": self.segments,
             "theme": self.theme.key(),
+            "mode": self.mode.key(),
+            "bucket": self.bucket,
+            "s3_profile": self.s3_profile,
+            "s3_session_profile": self.s3_session_profile,
         })
         .to_string()
     }
@@ -1038,6 +1166,12 @@ impl App {
         let Some(path) = config_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+        self.apply_config(&v);
+        self.saved_config = self.config_json();
+    }
+
+    /// 설정 값을 반영한다. 없는 키(옛 설정 파일)는 기본값 그대로 둔다
+    fn apply_config(&mut self, v: &serde_json::Value) {
         // 폴더가 지금 없어도(외장 드라이브 분리 등) 값은 버리지 않는다. 다운로드를 누를 때 없으면 다시 고르게 한다
         if let Some(f) = v["folder"].as_str().filter(|f| !f.is_empty()) {
             self.folder = Some(PathBuf::from(f));
@@ -1051,7 +1185,17 @@ impl App {
         if let Some(t) = v["theme"].as_str().and_then(Theme::from_key) {
             self.theme = t;
         }
-        self.saved_config = self.config_json();
+        if let Some(m) = v["mode"].as_str().and_then(Mode::from_key) {
+            self.mode = m;
+        }
+        if let Some(b) = v["bucket"].as_str() {
+            self.bucket = b.to_string();
+        }
+        let text = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        if let Some(p) = text("s3_profile") {
+            self.s3_profile = p;
+        }
+        self.s3_session_profile = text("s3_session_profile");
     }
 
     fn save_config_if_changed(&mut self) {
@@ -1247,11 +1391,16 @@ impl App {
         // 옛 목록의 큐 작업이 새 목록의 같은 번호를 가리키지 않도록 비운다
         self.queue.lock().unwrap().clear();
         let mut names: Vec<String> = Vec::new();
+        let presign = urls.iter().any(|e| s3_parts(&e.url).is_some()).then(|| self.presigner());
         let items: Vec<Item> = urls
             .iter()
             .map(|e| {
                 let name = unique_name(&dir, &target_name(e), &e.url, &mut names);
-                Item::new(e.line, e.url.clone(), name, dir.clone())
+                let mut item = Item::new(e.line, e.url.clone(), name, dir.clone());
+                if s3_parts(&e.url).is_some() {
+                    item.presign = presign.clone();
+                }
+                item
             })
             .collect();
         *self.items.lock().unwrap() = items;
@@ -1280,6 +1429,125 @@ impl App {
     fn spawn_workers(&self, idxs: &[usize]) {
         enqueue_jobs(&self.items, &self.queue, &self.active_workers, idxs, self.concurrent, self.segments);
     }
+
+    /// 지금 모드로 입력창을 해석한다. S3 모드에서 버킷을 알 수 없는 줄이 있으면 Err(안내 문구)
+    fn parse_input(&self) -> Result<Vec<Entry>, String> {
+        match self.mode {
+            Mode::Url => Ok(parse_urls(&self.input)),
+            Mode::S3 => parse_s3_input(&self.input, &self.bucket),
+        }
+    }
+
+    /// S3 항목의 요청 주소 발급기. 지금 설정(프로필)과 앱의 리전 캐시를 쓴다
+    fn presigner(&self) -> Presign {
+        if let Some(p) = &self.presign_override {
+            return Arc::clone(p);
+        }
+        let cfg = S3Config {
+            profile: self.s3_profile.clone(),
+            session_profile: self.s3_session_profile.clone(),
+            credentials_file: aws_credentials_path(),
+            session_cache: s3_session_path(),
+            region_endpoint: None,
+            regions: Arc::clone(&self.s3_regions),
+        };
+        Arc::new(move |id: &str| cfg.presign(id))
+    }
+}
+
+/// 자격증명을 찾지 못했을 때의 오류
+const NO_AWS_CREDS: &str = "AWS 자격증명을 찾을 수 없습니다 (~/.aws/credentials)";
+/// presigned 주소 유효 시간 상한 (12시간)
+const PRESIGN_MAX_SECS: u64 = 12 * 3600;
+
+/// S3 요청 주소 발급에 필요한 설정
+struct S3Config {
+    profile: String,
+    session_profile: Option<String>,
+    credentials_file: Option<PathBuf>,
+    session_cache: Option<PathBuf>,
+    /// 테스트용 리전 조회 주소 (기본 https://s3.amazonaws.com)
+    region_endpoint: Option<String>,
+    regions: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl S3Config {
+    /// `s3://버킷/키` → presigned GET 주소. 자격증명을 먼저 찾고(없으면 네트워크에 나가지 않는다), 리전은 버킷별로 한 번만 묻는다
+    fn presign(&self, id: &str) -> Result<String, String> {
+        let (bucket, key) = s3_parts(id).ok_or("S3 경로가 올바르지 않습니다")?;
+        let now = s3::now_unix();
+        let text = self.credentials_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+        let creds = resolve_creds(self.session_cache.as_deref(), text.as_deref(), self.session_profile.as_deref(), &self.profile, now)
+            .ok_or(NO_AWS_CREDS)?;
+        let region = self.region(bucket)?;
+        Ok(s3::presign_get(&creds, &region, bucket, key, presign_secs(&creds, now), now))
+    }
+
+    fn region(&self, bucket: &str) -> Result<String, String> {
+        if let Some(r) = self.regions.lock().unwrap().get(bucket) {
+            return Ok(r.clone());
+        }
+        // 네트워크 조회 중에는 잠그지 않는다 (동시에 두 번 물어도 같은 값이 들어갈 뿐)
+        let r = s3::bucket_region(bucket, self.region_endpoint.as_deref())?;
+        self.regions.lock().unwrap().insert(bucket.to_string(), r.clone());
+        Ok(r)
+    }
+}
+
+/// 자격증명 찾는 순서: ① 앱 세션 캐시(s3_session.json, 남은 시간 60초 이상)
+/// ② `session_profile` 프로필의 세션 토큰(만료 전. 만료 시각이 적혀 있지 않으면 판단할 수 없어 쓴다)
+/// ③ `profile` 프로필의 키(만료 시각이 적혀 있고 지났으면 쓰지 않는다)
+fn resolve_creds(session_cache: Option<&Path>, credentials: Option<&str>, session_profile: Option<&str>, profile: &str, now: u64) -> Option<s3::Creds> {
+    if let Some(c) = session_cache.and_then(|p| s3::load_session(p, now)) {
+        return Some(c);
+    }
+    let text = credentials?;
+    let fresh = |c: &s3::Creds| c.expires_at.is_none_or(|e| e >= now.saturating_add(s3::MIN_REMAINING_SECS));
+    if let Some(c) = session_profile
+        .and_then(|p| s3::parse_credentials(text, p))
+        .filter(|c| c.session_token.is_some() && fresh(c))
+    {
+        return Some(c);
+    }
+    s3::parse_credentials(text, profile).filter(fresh)
+}
+
+/// presign 유효 시간: 12시간과 자격증명 남은 시간 중 짧은 쪽
+fn presign_secs(creds: &s3::Creds, now: u64) -> u64 {
+    creds.expires_at.map_or(PRESIGN_MAX_SECS, |e| e.saturating_sub(now)).clamp(1, PRESIGN_MAX_SECS)
+}
+
+/// `s3://버킷/키` → (버킷, 키). S3 항목이 아니거나 버킷·키가 비었으면 None
+fn s3_parts(id: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = id.strip_prefix("s3://")?.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+}
+
+/// S3 모드 입력 → 항목. 줄에 s3://버킷/ 이 있으면 그 버킷, 없으면 `bucket` 칸.
+/// 둘 다 없는 줄이 있으면 시작하지 않도록 Err(안내 문구)
+fn parse_s3_input(input: &str, bucket: &str) -> Result<Vec<Entry>, String> {
+    // 버킷 칸에 s3://버킷/ 처럼 붙여넣어도 받아 준다
+    let field = bucket.trim().trim_start_matches("s3://").trim_end_matches('/');
+    let mut out = Vec::new();
+    let mut missing = Vec::new();
+    for (i, l) in input.lines().enumerate() {
+        let Some(p) = s3::parse_s3_line(l) else { continue };
+        let b = p.bucket.as_deref().unwrap_or(field);
+        if b.is_empty() {
+            missing.push((i + 1).to_string());
+            continue;
+        }
+        out.push(Entry { line: i + 1, url: format!("s3://{b}/{}", p.key), name: p.name });
+    }
+    if missing.is_empty() {
+        return Ok(out);
+    }
+    let more = if missing.len() > 3 { " 외" } else { "" };
+    missing.truncate(3);
+    Err(format!(
+        "버킷 칸이 비어 있습니다. 버킷을 입력하거나 s3://버킷/경로 로 쓰세요 ({}번째 줄{more})",
+        missing.join(", ")
+    ))
 }
 
 /// idxs 를 대기 상태로 큐에 넣는다. 항목마다 세대 번호를 올리므로 큐에 남아 있던 옛 작업은 워커가 건너뛴다.
@@ -1568,15 +1836,22 @@ fn next_update_state(prev: &UpdateState, result: Result<Option<(String, String)>
 }
 
 fn download(shared: Shared, idx: usize, segments: usize) {
-    let (url, dest, stop) = {
+    let (url, dest, stop, presign) = {
         let items = shared.lock().unwrap();
-        (items[idx].url.clone(), items[idx].dest(), Arc::clone(&items[idx].stop))
+        (items[idx].url.clone(), items[idx].dest(), Arc::clone(&items[idx].stop), items[idx].presign.clone())
     };
     let set = |s: Status| shared.lock().unwrap()[idx].status = s;
 
     // 큐에서 기다리는 동안 멈춤 신호가 왔으면 시작하지 않는다
     let result = match stop.load(Relaxed) {
-        STOP_NONE => download_file(&url, &dest, segments, &stop, &set),
+        STOP_NONE => match &presign {
+            None => download_file(&url, &url, &dest, segments, &stop, &set),
+            // S3: 시작·재개할 때마다 요청 주소를 새로 발급한다. 이어받기 기록은 식별자(url)로 맞춘다.
+            // 오류 문구에 서명 주소가 섞이지 않도록 식별자로 바꿔 둔다
+            Some(p) => p(&url).and_then(|fetch| {
+                download_file(&fetch, &url, &dest, segments, &stop, &set).map_err(|e| hide_fetch_url(e, &url))
+            }),
+        },
         _ => Err(STOPPED.to_string()),
     };
     match result {
@@ -1606,9 +1881,19 @@ fn download(shared: Shared, idx: usize, segments: usize) {
     }
 }
 
+/// 오류 문구 안의 http(s) 주소(presigned 서명·토큰 포함)를 식별자로 바꾼다
+fn hide_fetch_url(mut msg: String, id: &str) -> String {
+    while let Some(p) = msg.find("https://").or_else(|| msg.find("http://")) {
+        let end = msg[p..].find(|c: char| c.is_whitespace() || c == ')').map_or(msg.len(), |n| p + n);
+        msg.replace_range(p..end, id);
+    }
+    msg
+}
+
 /// `dest` 옆에 `<dest>.part`(받는 중인 본문)와 `<dest>.meta`(구간별 진행 상황)를 두고 받는다.
 /// 서버가 Range 를 지원하면 분할·이어받기, 아니면 처음부터 한 줄기로 받는다.
-fn download_file(url: &str, dest: &Path, segments: usize, stop: &AtomicU8, set: &(dyn Fn(Status) + Sync)) -> Result<(), String> {
+/// `url` 은 실제 요청 주소, `id` 는 이어받기 기록(.meta)에 남기는 식별자 (URL 항목은 둘이 같다)
+fn download_file(url: &str, id: &str, dest: &Path, segments: usize, stop: &AtomicU8, set: &(dyn Fn(Status) + Sync)) -> Result<(), String> {
     // 이 앱이 받지 않은 같은 이름 파일이 있으면 받기 전에 바로 실패한다 (완료 항목 다시 받기는 enqueue_jobs 가 먼저 지운다)
     if dest.exists() {
         return Err(EXISTS.to_string());
@@ -1644,7 +1929,7 @@ fn download_file(url: &str, dest: &Path, segments: usize, stop: &AtomicU8, set: 
         let etag = header(&probe, ETAG);
         drop(probe);
         match total {
-            Some(total) => download_ranged(&client, url, &part, &meta, total, &etag, segments, stop, set)?,
+            Some(total) => download_ranged(&client, url, id, &part, &meta, total, &etag, segments, stop, set)?,
             None => {
                 // 206 인데 전체 크기를 안 알려주는 서버: 일반 GET 으로 받는다
                 let resp = client.get(url).send().map_err(|e| e.to_string())?;
@@ -1720,6 +2005,7 @@ struct Meta {
 fn download_ranged(
     client: &Client,
     url: &str,
+    id: &str,
     part: &Path,
     meta_path: &Path,
     total: u64,
@@ -1728,8 +2014,8 @@ fn download_ranged(
     stop: &AtomicU8,
     set: &(dyn Fn(Status) + Sync),
 ) -> Result<(), String> {
-    // 같은 파일(URL·크기·ETag 일치)의 진행 기록이 남아 있으면 거기서부터 이어받는다
-    let resumed = load_meta(meta_path, url).filter(|m| m.total == total && m.etag == etag && part.exists());
+    // 같은 파일(식별자·크기·ETag 일치)의 진행 기록이 남아 있으면 거기서부터 이어받는다
+    let resumed = load_meta(meta_path, id).filter(|m| m.total == total && m.etag == etag && part.exists());
     let is_resume = resumed.is_some();
     let segs: Vec<Seg> = match resumed {
         Some(m) => m
@@ -1759,7 +2045,7 @@ fn download_ranged(
         let done = segs.iter().map(|s| s.done.load(Relaxed)).sum();
         set(Status::Downloading { done, total: Some(total), parts });
     };
-    let save = || save_meta(meta_path, total, etag, url, &segs);
+    let save = || save_meta(meta_path, total, etag, id, &segs);
     let last_save = Mutex::new(Instant::now());
     let tick = || {
         progress();
@@ -1858,7 +2144,7 @@ fn fetch_once(client: &Client, url: &str, file: &File, seg: &Seg, stop: &AtomicU
     Ok(())
 }
 
-/// .meta 형식: 전체 크기 / ETag / URL / 구간마다 "시작 끝 받은수" 한 줄
+/// .meta 형식: 전체 크기 / ETag / 식별자(URL 또는 s3://버킷/키) / 구간마다 "시작 끝 받은수" 한 줄
 fn save_meta(path: &Path, total: u64, etag: &str, url: &str, segs: &[Seg]) -> Result<(), String> {
     let mut s = format!("{total}\n{etag}\n{url}\n");
     for seg in segs {
@@ -2054,8 +2340,12 @@ fn parse_line(line: &str) -> Option<(String, Option<String>)> {
 }
 
 /// 저장 파일명: 사용자 이름 + URL 원본 확장자, 또는 URL 원본 파일명
+/// S3 항목은 키의 마지막 조각이 원본 파일명이다 (키의 ?·#·% 는 주소 문법이 아니라 이름의 일부)
 fn target_name(e: &Entry) -> String {
-    let original = file_name_from_url(&e.url, e.line);
+    let original = match s3_parts(&e.url) {
+        Some((_, key)) => file_name_from_key(key, e.line),
+        None => file_name_from_url(&e.url, e.line),
+    };
     match &e.name {
         Some(n) => format!("{n}{}", extension_of(&original)),
         None => original,
@@ -2094,6 +2384,15 @@ fn file_name_from_url(url: &str, idx: usize) -> String {
         .decode_utf8_lossy()
         .to_string();
     let cleaned = sanitize(&decoded);
+    if cleaned.is_empty() {
+        format!("file_{idx}")
+    } else {
+        cleaned
+    }
+}
+
+fn file_name_from_key(key: &str, idx: usize) -> String {
+    let cleaned = sanitize(key.rsplit('/').next().unwrap_or(""));
     if cleaned.is_empty() {
         format!("file_{idx}")
     } else {
@@ -2871,5 +3170,335 @@ mod pool_tests {
         let none = d.join("none.txt");
         std::fs::write(&none, "no urls here\n").unwrap();
         assert_eq!(url_lines_from_file(&none), None);
+    }
+}
+
+#[cfg(test)]
+mod s3_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::TcpListener;
+
+    const ID: &str = "s3://example-bucket/data/big.bin";
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ud_s3_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn data() -> Arc<Vec<u8>> {
+        Arc::new((0..3_500_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect())
+    }
+
+    /// 부를 때마다 서명이 다른 주소를 발급하는 가짜 presign. (받은 식별자, 발급한 주소) 를 기록한다
+    fn fake_presign(base: &str) -> (Presign, Arc<Mutex<Vec<(String, String)>>>) {
+        let log: Arc<Mutex<Vec<(String, String)>>> = Default::default();
+        let (base, l) = (base.to_string(), Arc::clone(&log));
+        let p: Presign = Arc::new(move |id: &str| {
+            let mut l = l.lock().unwrap();
+            let url = format!("{base}?X-Amz-Signature=sig{}&X-Amz-Security-Token=TOPSECRETTOKEN", l.len());
+            l.push((id.to_string(), url.clone()));
+            Ok(url)
+        });
+        (p, log)
+    }
+
+    fn s3_item(dir: &Path, name: &str, presign: Presign) -> Shared {
+        let mut it = Item::new(1, ID.into(), name.into(), dir.to_path_buf());
+        it.presign = Some(presign);
+        Arc::new(Mutex::new(vec![it]))
+    }
+
+    fn settled(items: &[Item]) -> bool {
+        !items.iter().any(|i| matches!(i.status, Status::Waiting | Status::Downloading { .. }))
+    }
+
+    fn wait_settled(shared: &Shared) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !settled(&shared.lock().unwrap()) {
+            assert!(Instant::now() < deadline, "시간 초과");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // (i) S3 항목은 발급된 주소로 받는다. URL 항목과 섞여 있어도 URL 항목은 발급기를 부르지 않는다
+    #[test]
+    fn s3_item_downloads_via_issued_url_mixed_with_url_item() {
+        let data = data();
+        let base = tests::serve_slow_pub(Arc::clone(&data), 0);
+        let dir = tmp("issued");
+        let (presign, log) = fake_presign(&base);
+        let mut app = App {
+            concurrent: 2,
+            mode: Mode::S3,
+            bucket: "example-bucket".into(),
+            presign_override: Some(presign),
+            ..App::default()
+        };
+        app.input = "받은 파일 | data/big.bin".into();
+        let mut entries = app.parse_input().unwrap();
+        entries.push(Entry { line: 2, url: base.clone(), name: Some("plain".into()) });
+        app.start(entries, dir.clone());
+        wait_settled(&app.items);
+        {
+            let items = app.items.lock().unwrap();
+            assert!(items.iter().all(|i| matches!(i.status, Status::Finished)));
+            assert_eq!(items[0].url, ID, "목록에는 식별자를 보인다");
+            assert!(items[0].presign.is_some() && items[1].presign.is_none());
+        }
+        assert_eq!(std::fs::read(dir.join("받은 파일.bin")).unwrap(), *data);
+        assert_eq!(std::fs::read(dir.join("plain.bin")).unwrap(), *data);
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "S3 항목 하나만 발급");
+        assert_eq!(log[0].0, ID);
+    }
+
+    // (ii) 일시정지 뒤 다른 주소가 발급돼도 같은 식별자의 기록으로 받은 곳부터 이어받는다
+    #[test]
+    fn s3_resume_after_pause_with_new_presigned_url() {
+        const MARK: u8 = 0xAA;
+        let data = data();
+        let base = tests::serve_slow_pub(Arc::clone(&data), 20);
+        let dir = tmp("resume");
+        let (presign, log) = fake_presign(&base);
+        let shared = s3_item(&dir, "big.bin", presign);
+        let stop = Arc::clone(&shared.lock().unwrap()[0].stop);
+        let (w, w_stop) = (Arc::clone(&shared), Arc::clone(&stop));
+        thread::spawn(move || loop {
+            if matches!(w.lock().unwrap()[0].status, Status::Downloading { done, .. } if done > 100_000) {
+                w_stop.store(STOP_PAUSE, Relaxed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        });
+        download(Arc::clone(&shared), 0, 4);
+        assert!(matches!(shared.lock().unwrap()[0].status, Status::Paused { resumable: true, done, .. } if done > 0));
+
+        // 진행 기록에는 식별자만 남고 발급 주소(서명·토큰·호스트)는 없다
+        let meta_path = dir.join("big.bin.meta");
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        assert_eq!(raw.lines().nth(2), Some(ID));
+        assert!(!raw.contains("X-Amz") && !raw.contains("TOPSECRETTOKEN") && !raw.contains("127.0.0.1"), "{raw}");
+        assert!(matches!(paused_from_disk(&dir.join("big.bin"), ID), Status::Paused { resumable: true, .. }));
+
+        // 받은 구간을 마커로 덮는다: 이어받기라면 마커가 남고, 처음부터 받았다면 서버 데이터로 덮인다
+        let m = load_meta(&meta_path, ID).unwrap();
+        let part = OpenOptions::new().write(true).open(dir.join("big.bin.part")).unwrap();
+        let got: Vec<(usize, usize)> = m.segs.iter().map(|(s, e, d)| (*s as usize, (*d).min(e - s) as usize)).collect();
+        for &(s, d) in &got {
+            part.write_all_at(&vec![MARK; d], s as u64).unwrap();
+        }
+        drop(part);
+
+        stop.store(STOP_NONE, Relaxed);
+        download(Arc::clone(&shared), 0, 4);
+        assert!(matches!(shared.lock().unwrap()[0].status, Status::Finished));
+        let out = std::fs::read(dir.join("big.bin")).unwrap();
+        assert_eq!(out.len(), data.len());
+        let mut kept = 0;
+        for (i, b) in out.iter().enumerate() {
+            match got.iter().find(|(s, d)| i >= *s && i < s + d) {
+                Some(_) => {
+                    assert_eq!(*b, MARK, "{i}: 받은 구간을 다시 받지 않아야 한다");
+                    kept += 1;
+                }
+                None => assert_eq!(*b, data[i], "{i}: 나머지는 서버 데이터"),
+            }
+        }
+        assert!(kept > 100_000);
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "시작·재개마다 새로 발급");
+        assert!(log.iter().all(|(id, _)| id == ID));
+        assert_ne!(log[0].1, log[1].1, "두 번째는 다른 주소");
+        assert!(!dir.join("big.bin.meta").exists() && !dir.join("big.bin.part").exists());
+    }
+
+    // (iii) 발급 실패 → 오류 상태 + 문구 표시(자동 선택), 파일은 만들지 않는다
+    #[test]
+    fn presign_failure_marks_item_failed() {
+        let dir = tmp("fail");
+        let p: Presign = Arc::new(|_: &str| Err(NO_AWS_CREDS.to_string()));
+        let shared = s3_item(&dir, "big.bin", p);
+        download(Arc::clone(&shared), 0, 4);
+        let items = shared.lock().unwrap();
+        assert!(matches!(&items[0].status, Status::Failed(e) if e == NO_AWS_CREDS));
+        assert!(items[0].selected);
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "아무 파일도 생기지 않는다");
+    }
+
+    // 실제 발급기: 자격증명이 없으면 네트워크에 나가지 않고 같은 문구로 실패한다
+    #[test]
+    fn real_presigner_without_creds_fails_with_message() {
+        let dir = tmp("nocreds");
+        let cfg = S3Config {
+            profile: "default".into(),
+            session_profile: None,
+            credentials_file: Some(dir.join("없음")),
+            session_cache: Some(dir.join("s3_session.json")),
+            // 연결할 수 없는 주소: 리전을 물으러 나갔다면 다른 오류가 났을 것이다
+            region_endpoint: Some("http://127.0.0.1:1".into()),
+            regions: Default::default(),
+        };
+        assert_eq!(cfg.presign(ID), Err(NO_AWS_CREDS.to_string()));
+    }
+
+    // 받는 중 연결 오류가 나도 오류 문구에 서명 주소·토큰이 남지 않는다
+    #[test]
+    fn download_error_hides_presigned_url() {
+        let dir = tmp("hide");
+        let p: Presign = Arc::new(|_: &str| Ok("http://127.0.0.1:1/big.bin?X-Amz-Signature=abc&X-Amz-Security-Token=TOPSECRETTOKEN".into()));
+        let shared = s3_item(&dir, "big.bin", p);
+        download(Arc::clone(&shared), 0, 4);
+        let Status::Failed(e) = shared.lock().unwrap()[0].status.clone() else { panic!("실패여야 한다") };
+        assert!(!e.contains("X-Amz") && !e.contains("TOPSECRETTOKEN") && !e.contains("127.0.0.1"), "{e}");
+        assert_eq!(
+            hide_fetch_url("error sending request for url (https://h/k?X-Amz-Signature=s): refused".into(), ID),
+            format!("error sending request for url ({ID}): refused")
+        );
+    }
+
+    // (iv) S3 입력 해석 → 식별자·저장 파일명
+    #[test]
+    fn s3_input_parsing_and_names() {
+        let input = "사진 | photos/2026 봄, 여행.JPG\nphotos/2026 봄, 여행.zip\n\n# 주석\ns3://other-bucket/a/b.tar.gz\tarchive\ndocs/50%25 off?.pdf\nfolder/";
+        let es = parse_s3_input(input, " example-bucket ").unwrap();
+        let got: Vec<(usize, &str, String)> = es.iter().map(|e| (e.line, e.url.as_str(), target_name(e))).collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "s3://example-bucket/photos/2026 봄, 여행.JPG", "사진.JPG".to_string()),
+                (2, "s3://example-bucket/photos/2026 봄, 여행.zip", "2026 봄, 여행.zip".to_string()),
+                (5, "s3://other-bucket/a/b.tar.gz", "archive.tar.gz".to_string()),
+                (6, "s3://example-bucket/docs/50%25 off?.pdf", "50%25 off_.pdf".to_string()),
+                (7, "s3://example-bucket/folder/", "file_7".to_string()),
+            ]
+        );
+        // 버킷 칸에 s3://버킷/ 을 붙여넣어도 된다
+        assert_eq!(parse_s3_input("a.zip", "s3://example-bucket/").unwrap()[0].url, "s3://example-bucket/a.zip");
+        // 버킷 칸이 비어도 모든 줄에 버킷이 있으면 시작할 수 있다
+        assert_eq!(parse_s3_input("s3://example-bucket/a.zip", "").unwrap().len(), 1);
+        // 버킷을 알 수 없는 줄이 있으면 시작하지 않는다
+        let err = parse_s3_input("s3://example-bucket/a.zip\nb.zip\nc.zip", "  ").unwrap_err();
+        assert!(err.contains("버킷") && err.contains("2, 3번째 줄"), "{err}");
+        // 같은 이름 처리(unique_name)는 URL 모드와 같다
+        let d = tmp("names");
+        std::fs::write(d.join("2026 봄, 여행.zip"), b"x").unwrap();
+        let mut used = vec![];
+        assert_eq!(unique_name(&d, &target_name(&es[1]), &es[1].url, &mut used), "2026 봄, 여행 (1).zip");
+        // URL 모드 해석은 그대로
+        let app = App { input: "https://a.com/x.jpg".into(), ..App::default() };
+        assert_eq!(app.parse_input().unwrap()[0].url, "https://a.com/x.jpg");
+        assert_eq!(s3_parts("s3://b/k/x"), Some(("b", "k/x")));
+        assert_eq!(s3_parts("https://b/k"), None);
+    }
+
+    // (v) 설정 저장·복원: 모드·버킷·프로필. 새 키가 없는 옛 설정도 그대로 읽힌다
+    #[test]
+    fn s3_config_roundtrip_and_old_config() {
+        let app = App {
+            mode: Mode::S3,
+            bucket: "example-bucket".into(),
+            s3_profile: "example".into(),
+            s3_session_profile: Some("example-session".into()),
+            ..App::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&app.config_json()).unwrap();
+        let mut loaded = App::default();
+        loaded.apply_config(&v);
+        assert_eq!(loaded.mode, Mode::S3);
+        assert_eq!(loaded.bucket, "example-bucket");
+        assert_eq!((loaded.s3_profile.as_str(), loaded.s3_session_profile.as_deref()), ("example", Some("example-session")));
+        assert_eq!(loaded.config_json(), app.config_json());
+
+        let old: serde_json::Value = serde_json::from_str(r#"{"folder":"/tmp/x","concurrent":5,"segments":2,"theme":"dark"}"#).unwrap();
+        let mut loaded = App::default();
+        loaded.apply_config(&old);
+        assert_eq!((loaded.mode, loaded.bucket.as_str()), (Mode::Url, ""));
+        assert_eq!((loaded.s3_profile.as_str(), loaded.s3_session_profile.as_deref()), ("default", None));
+        assert_eq!((loaded.concurrent, loaded.segments, loaded.theme), (5, 2, Theme::Dark));
+    }
+
+    // 자격증명 찾는 순서: 세션 캐시 → 세션 프로필(토큰 있고 만료 전) → 기본 프로필 장기 키
+    #[test]
+    fn credential_resolution_order() {
+        let dir = tmp("creds");
+        let now = 1_800_000_000u64;
+        let text = format!(
+            "[default]\naws_access_key_id = AKIADEFAULT\naws_secret_access_key = test-secret\n\n\
+             [example-session]\naws_access_key_id = ASIASESSION\naws_secret_access_key = test-secret\naws_session_token = test-token\naws_session_expiration = 2027-06-01T00:00:00Z\n\n\
+             [stale-session]\naws_access_key_id = ASIASTALE\naws_secret_access_key = test-secret\naws_session_token = test-token\naws_session_expiration = 2020-01-01T00:00:00Z\n\n\
+             [no-token]\naws_access_key_id = AKIANOTOKEN\naws_secret_access_key = test-secret\n"
+        );
+        let cache = dir.join("s3_session.json");
+        let key = |c: Option<s3::Creds>| c.map(|c| c.access_key);
+        let r = |sp: Option<&str>, p: &str| key(resolve_creds(Some(&cache), Some(&text), sp, p, now));
+        assert_eq!(r(Some("example-session"), "default").as_deref(), Some("ASIASESSION"));
+        assert_eq!(r(Some("stale-session"), "default").as_deref(), Some("AKIADEFAULT"), "만료된 세션은 건너뛴다");
+        assert_eq!(r(Some("no-token"), "default").as_deref(), Some("AKIADEFAULT"), "토큰 없는 프로필은 세션으로 보지 않는다");
+        assert_eq!(r(None, "default").as_deref(), Some("AKIADEFAULT"));
+        assert_eq!(r(None, "missing"), None);
+        assert_eq!(key(resolve_creds(Some(&cache), None, None, "default", now)), None);
+        // 앱 세션 캐시가 유효하면 가장 먼저
+        let cached = s3::Creds {
+            access_key: "ASIACACHE".into(),
+            secret_key: "test-secret".into(),
+            session_token: Some("test-token".into()),
+            expires_at: Some(now + 3600),
+        };
+        s3::save_session(&cache, &cached).unwrap();
+        assert_eq!(r(Some("example-session"), "default").as_deref(), Some("ASIACACHE"));
+        assert_eq!(key(resolve_creds(Some(&cache), None, None, "default", now)).as_deref(), Some("ASIACACHE"));
+        // 캐시가 만료됐으면 다음 순서로
+        assert_eq!(key(resolve_creds(Some(&cache), Some(&text), None, "default", now + 3600)).as_deref(), Some("AKIADEFAULT"));
+
+        // presign 유효 시간: 12시간과 남은 시간 중 짧은 쪽
+        assert_eq!(presign_secs(&cached, now), 3600);
+        assert_eq!(presign_secs(&s3::Creds { expires_at: None, ..cached.clone() }, now), 12 * 3600);
+        assert_eq!(presign_secs(&s3::Creds { expires_at: Some(now + 20 * 3600), ..cached }, now), 12 * 3600);
+    }
+
+    /// x-amz-bucket-region 헤더만 돌려주는 가짜 리전 조회 서버. 받은 요청 수를 센다
+    fn serve_region(region: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                h.fetch_add(1, Relaxed);
+                let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                while r.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    line.clear();
+                }
+                let _ = s.write_all(format!("HTTP/1.1 403 Forbidden\r\nx-amz-bucket-region: {region}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    // 실제 발급기: 리전은 버킷별로 한 번만 묻고, 유효 시간은 12시간 이내
+    #[test]
+    fn real_presigner_caches_region_per_bucket() {
+        let dir = tmp("presign");
+        let creds = dir.join("credentials");
+        std::fs::write(&creds, "[default]\naws_access_key_id = AKIADEFAULT\naws_secret_access_key = test-secret\n").unwrap();
+        let (endpoint, hits) = serve_region("ap-northeast-2");
+        let cfg = S3Config {
+            profile: "default".into(),
+            session_profile: None,
+            credentials_file: Some(creds),
+            session_cache: Some(dir.join("s3_session.json")),
+            region_endpoint: Some(endpoint),
+            regions: Default::default(),
+        };
+        let a = cfg.presign("s3://example-bucket/photos/2026 봄.zip").unwrap();
+        let b = cfg.presign("s3://example-bucket/b.zip").unwrap();
+        assert!(a.starts_with("https://example-bucket.s3.ap-northeast-2.amazonaws.com/photos/2026%20"), "{a}");
+        assert!(a.contains("X-Amz-Expires=43200") && b.contains("X-Amz-Expires=43200"));
+        assert_eq!(hits.load(Relaxed), 1, "같은 버킷의 리전은 한 번만 묻는다");
+        assert_eq!(cfg.regions.lock().unwrap().get("example-bucket").map(String::as_str), Some("ap-northeast-2"));
     }
 }
