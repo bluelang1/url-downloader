@@ -1,7 +1,7 @@
 # URL Downloader (Rust/egui, macOS)
 
 ## 검증
-- `cargo test` - 27개, ~4초. 로컬 Range 서버로 분할·이어받기까지 검증
+- `cargo test` - 55개, ~5초. 로컬 Range 서버로 분할·이어받기까지 검증
 - `cargo build --release 2>&1 | grep -c ^warning` - 경고 0 유지
 - 앱 확인은 `cargo run --release`. 로컬 패키징·재설치(bundle.sh)는 CI·비상용
 
@@ -11,6 +11,7 @@
 - `URL_DOWNLOADER_MODE=url|s3` / `URL_DOWNLOADER_BUCKET=<이름>` - 입력 모드·버킷 (설정 파일에는 저장 안 함)
 - `URL_DOWNLOADER_SCREENSHOT=<path.ppm>` (+`_FRAMES=n`) - 프레임버퍼 덤프, `sips -s format png` 로 변환
 - `URL_DOWNLOADER_UPDATE_API=<url>` - 릴리스 API 를 가짜 JSON 으로 대체
+- `URL_DOWNLOADER_STS_ENDPOINT=<url>` - MFA 세션 발급(STS GetSessionToken)을 가짜 서버로 대체
 
 ## 릴리스 (승인 후에만)
 - Cargo.toml version 올림 → `git tag vX.Y.Z` → main+태그 푸시 → Release 워크플로가 universal zip 업로드. 태그 ≠ Cargo 버전이면 CI 실패
