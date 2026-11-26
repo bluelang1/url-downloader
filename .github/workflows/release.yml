@@ -10,7 +10,7 @@ name: Release
 # 필요한 설정 (scripts/setup-release-env.sh 가 안내하며 만든다):
 #   - 환경 `release`: 배포 가능한 ref 를 태그 패턴 `v*` 로만 제한 (브랜치에서는 서명 작업이 돌지 않게)
 #   - 환경 `release` 의 시크릿 `MINISIGN_KEY`(minisign 비밀키 파일 내용 전체), `MINISIGN_PASSWORD`(그 비밀키 비밀번호)
-#   - 예비 키는 GitHub 에 두지 않는다 (주 키가 유출됐을 때 교체용)
+#   - 예비 키는 같은 환경의 `MINISIGN_SPARE_KEY`·`MINISIGN_SPARE_PASSWORD` 에 둔다 (이 워크플로는 쓰지 않음. 주 키 시크릿이 망가졌을 때 교체용)
 # 비상시(CI 를 쓸 수 없을 때)에는 scripts/release.sh 로 개발자 컴퓨터에서 빌드·서명·게시한다.
 on:
   push:

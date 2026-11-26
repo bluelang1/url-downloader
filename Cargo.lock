@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "url_downloader"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eframe",
  "hmac",

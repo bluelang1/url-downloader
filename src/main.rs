@@ -18,7 +18,12 @@ const REPO: &str = "bluelang1/url-downloader";
 
 /// 자체 업데이트 zip 의 minisign 서명을 확인할 공개키 (공개키 파일 `*.pub` 의 두 번째 줄, base64 한 줄).
 /// 주 키·예비 키를 넣고, 하나라도 검증에 성공하면 통과. 비어 있으면 모든 업데이트 설치를 거부한다
-const UPDATE_PUBLIC_KEYS: &[&str] = &[];
+const UPDATE_PUBLIC_KEYS: &[&str] = &[
+    // 주 키 (Release 워크플로의 sign 작업이 사용)
+    "RWTY7w7NGNG4cZkxpWo+6IeOvKdzM6SGPfSab/+9chivpkdsC7mggr+E",
+    // 예비 키 (주 키 교체용, 평소에는 쓰지 않음)
+    "RWSyfhPiqBCpxpUeIlF53YTd+PdJTNYctfOaKrKVI2U4dByMh83CZ+5A",
+];
 /// 업데이트 서명 파일(`<zip>.minisig`) 크기 상한
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 /// 업데이트 zip 크기 상한 (릴리스 API 의 자산 크기, 응답 Content-Length, 실제로 받은 양 모두에 적용)
