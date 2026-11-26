@@ -29,6 +29,7 @@ jobs:
           name: release-zip
           path: dist/*.zip
           if-no-files-found: error
+          retention-days: 1
   # 쓰기 권한은 릴리스 생성에만. 리포 코드는 체크아웃하지 않는다
   publish:
     needs: build

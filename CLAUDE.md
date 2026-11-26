@@ -11,7 +11,7 @@
 - `URL_DOWNLOADER_START_VIEW=help|about` - 시작 화면
 - `URL_DOWNLOADER_MODE=url|s3` / `URL_DOWNLOADER_BUCKET=<이름>` - 입력 모드·버킷. 켤 때 바로 저장하지는 않지만, 실행 중 다른 설정이 바뀌어 config.json 을 저장하면 이 값도 함께 저장됨
 - `URL_DOWNLOADER_SCREENSHOT=<path.ppm>` (+`_FRAMES=n`) - 프레임버퍼 덤프, `sips -s format png` 로 변환
-- `URL_DOWNLOADER_UPDATE_API=<url>` - 릴리스 API 를 가짜 JSON 으로 대체
+- `URL_DOWNLOADER_UPDATE_API=<url>` - 릴리스 API 를 가짜 JSON 으로 대체. 업데이트 확인 화면까지만 시험 가능(설치는 공식 릴리스 주소만 허용)
 - `URL_DOWNLOADER_STS_ENDPOINT=<url>` - MFA 세션 발급(STS GetSessionToken)을 가짜 서버로 대체
 
 ## S3 모드 (src/s3.rs + main.rs)

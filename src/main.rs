@@ -2529,7 +2529,8 @@ fn mark_quarantine(path: &Path) {
         .arg("-w")
         .arg("com.apple.quarantine")
         .arg(quarantine_value(now))
-        .arg(path)
+        // 절대경로로 넘긴다: 상대경로의 `-` 로 시작하는 파일명이 옵션으로 읽히지 않게
+        .arg(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

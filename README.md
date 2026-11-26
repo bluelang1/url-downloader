@@ -91,6 +91,8 @@ git tag v0.3.0 && git push origin main v0.3.0
 "/Applications/URL Downloader.app/Contents/MacOS/url_downloader" --self-update <zip-url>
 ```
 
+`--self-update` 는 이 리포의 공식 릴리스 주소(`https://github.com/bluelang1/url-downloader/releases/download/...`)만 받습니다.
+
 ## 아이콘
 
 원본은 `assets/icon.png` 입니다. `assets/icon-1024.png`(모서리 투명, 창·Dock 아이콘으로 바이너리에 포함)와
