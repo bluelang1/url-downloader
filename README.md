@@ -72,16 +72,19 @@ cd url-downloader
 ## 업데이트와 릴리스
 
 앱은 시작할 때 이 저장소의 최신 릴리스를 확인합니다.
-릴리스는 태그를 푸시하면 GitHub Actions 가 만듭니다.
+릴리스는 개발자가 자기 컴퓨터에서 `scripts/release.sh` 로 만듭니다. GitHub Actions 는 같은 태그를 검증만 하고 아무것도 게시하지 않습니다.
 
 ```sh
 # 1. Cargo.toml 의 version 을 올리고 커밋
-# 2. 같은 번호로 태그를 푸시
-git tag v0.3.0 && git push origin main v0.3.0
+# 2. 같은 번호로 태그를 푸시 (vX.Y.Z 형식만, v0.6.0-rc1 같은 사전 릴리스 태그는 쓰지 않음)
+git tag v0.6.0 && git push origin main v0.6.0
+# 3. Release 워크플로(검증 전용)가 성공하면, 로컬에서 빌드·서명·릴리스 생성 (서명 키 비밀번호는 직접 입력)
+scripts/release.sh v0.6.0
 ```
 
-`release.yml` 이 macOS 에서 테스트·빌드 후 `URL-Downloader-v<버전>-macos-universal.zip`(Apple Silicon + Intel) 을 릴리스에 올리고,
-설치된 앱은 다음 실행 때 업데이트 버튼을 보여 줍니다. 태그와 `Cargo.toml` 버전이 다르면 워크플로가 실패합니다.
+- `release.yml` 은 태그에서 태그·`Cargo.toml` 버전 일치, 서명 키 설정(`UPDATE_PUBLIC_KEYS` 에 서로 다른 키 2개 이상), 테스트, universal 번들 빌드를 확인합니다. 읽기 권한만 쓰고 파일을 올리지 않습니다.
+- `scripts/release.sh` 는 로컬 태그와 원격 태그가 같은 커밋인지, 그 커밋의 Release 워크플로가 성공했는지 확인한 뒤, 태그를 새 워크트리로 꺼내 깨끗한 소스에서 `URL-Downloader-v<버전>-macos-universal.zip`(Apple Silicon + Intel) 을 빌드합니다. 서명할 공개키가 그 태그의 `UPDATE_PUBLIC_KEYS` 에 없으면 멈춥니다. 서명 후 초안 릴리스에 zip 과 `.minisig` 를 올리고, 두 파일이 다 올라간 것을 확인한 다음 공개합니다.
+- 설치된 앱은 서명 파일까지 있는 릴리스만 업데이트로 보여 줍니다.
 
 터미널에서 확인할 때:
 
@@ -95,13 +98,16 @@ git tag v0.3.0 && git push origin main v0.3.0
 
 ### 업데이트 서명 검증
 
-앱은 업데이트 zip 을 받은 뒤, 압축을 풀기 전에 개발자 서명([minisign](https://jedisct1.github.io/minisign/))을 확인합니다.
+앱은 업데이트를 설치하기 전에 개발자 서명([minisign](https://jedisct1.github.io/minisign/))을 확인합니다.
 GitHub 계정이나 릴리스가 바뀌어도, 개발자가 자기 컴퓨터에만 둔 키로 서명한 파일이 아니면 설치하지 않습니다.
+서명할 zip 도 개발자 컴퓨터에서 태그 소스로 직접 빌드하므로, CI 나 릴리스에 올라간 파일을 바꿔치기해도 서명되지 않습니다.
 
 - 서명 파일은 같은 릴리스의 `<zip 파일명>.minisig` 입니다 (예: `URL-Downloader-v0.6.0-macos-universal.zip.minisig`).
+- 서명 파일을 zip 보다 먼저 받아 크기·형식을 확인하고, zip 을 받은 뒤 압축을 풀기 전에 검증합니다. 서명 파일이 없으면 zip 을 받지 않습니다.
 - 서명의 trusted comment 는 `file:<zip 파일명>` 이어야 하고, 릴리스 태그·주소·파일명의 버전이 같으며 현재 버전보다 높아야 설치합니다(예전 버전으로 되돌리기 방지). `--self-update` 도 같은 확인을 거칩니다.
-- 서명 파일이 없거나 맞지 않으면 받은 파일을 지우고 "업데이트 파일의 서명을 확인할 수 없어 설치하지 않습니다" 로 끝납니다.
-- 릴리스 워크플로가 끝나면 개발자가 `scripts/sign-release.sh vX.Y.Z` 로 서명을 만들어 올립니다. 서명 키는 GitHub 에 두지 않습니다.
+- 서명 파일이 없거나 맞지 않으면 받은 파일을 지우고 "업데이트 파일의 서명을 확인할 수 없어 설치하지 않습니다" 로 끝납니다. 이때는 [릴리스 페이지](https://github.com/bluelang1/url-downloader/releases)에서 직접 받을 수 있습니다.
+- 업데이트 파일은 매번 새로 만드는 임의 이름의 임시 폴더(권한 0700)에서 받고, 끝나면 지웁니다.
+- 남는 위험: 서명 키가 유출되면 이 검증은 막지 못합니다. 정식 서명된 예전 버전 가운데 현재보다 높은 버전으로 고정시키는 것도 막지 못합니다.
 
 ## 아이콘
 

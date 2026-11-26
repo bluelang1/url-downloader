@@ -21,6 +21,14 @@ const REPO: &str = "bluelang1/url-downloader";
 const UPDATE_PUBLIC_KEYS: &[&str] = &[];
 /// 업데이트 서명 파일(`<zip>.minisig`) 크기 상한
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
+/// 업데이트 요청의 연결 타임아웃
+const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 릴리스 API·서명 파일 요청의 전체 타임아웃 (작은 응답)
+const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 업데이트 zip 내려받기의 멈춤 타임아웃: 이 시간 동안 한 바이트도 오지 않으면 끊는다 (전체 시간 제한 없음)
+const UPDATE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 업데이트 설치 실패 문구 끝에 붙이는 안내
+const MANUAL_UPDATE_HINT: &str = "릴리스 페이지(https://github.com/bluelang1/url-downloader/releases)에서 직접 받을 수 있습니다";
 
 /// 분할 구간 하나의 최소 크기. 이보다 작은 파일은 분할하지 않는다
 const MIN_CHUNK: u64 = 1024 * 1024;
@@ -2785,19 +2793,15 @@ fn load_meta(path: &Path, url: &str) -> Option<Meta> {
     }
 }
 
-/// (새 버전, zip 다운로드 URL). 현재 버전 이하이면 None
+/// (새 버전, zip 다운로드 URL). 현재 버전 이하이거나 서명된 zip 이 없으면 None
 fn fetch_latest_release() -> Result<Option<(String, String)>, String> {
-    let client = Client::builder()
-        .user_agent(format!("url-downloader/{VERSION}"))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
+    let resp = update_client()?
         .get(
             std::env::var("URL_DOWNLOADER_UPDATE_API")
                 .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest")),
         )
         .header("Accept", "application/vnd.github+json")
+        .timeout(UPDATE_REQUEST_TIMEOUT)
         .send()
         .map_err(|e| e.to_string())?;
     if resp.status() == StatusCode::NOT_FOUND {
@@ -2808,19 +2812,27 @@ fn fetch_latest_release() -> Result<Option<(String, String)>, String> {
     }
     let body = resp.text().map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let tag = json["tag_name"].as_str().unwrap_or("");
-    let latest = tag.trim_start_matches('v').to_string();
-    if parse_version(&latest) <= parse_version(VERSION) {
-        return Ok(None);
+    Ok(latest_release_from_json(&json, VERSION))
+}
+
+/// 릴리스 API 응답에서 (새 버전, zip 주소). zip 과 같은 이름 + `.minisig` 자산이 함께 있을 때만 새 버전으로 본다.
+/// 서명 전 릴리스(zip 만 있음)는 업데이트로 제안하지 않는다 (설치해도 서명 확인에서 실패하므로 최신 상태와 같은 취급)
+fn latest_release_from_json(json: &serde_json::Value, current: &str) -> Option<(String, String)> {
+    let latest = json["tag_name"].as_str().unwrap_or("").trim_start_matches('v');
+    if parse_version(latest) <= parse_version(current) {
+        return None;
     }
-    let url = json["assets"]
+    let assets: Vec<(&str, &str)> = json["assets"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|a| a["name"].as_str().is_some_and(|n| n.ends_with(".zip")))
-        .find_map(|a| a["browser_download_url"].as_str().map(str::to_string))
-        .ok_or_else(|| format!("v{latest} 릴리스에 zip 파일이 없습니다"))?;
-    Ok(Some((latest, url)))
+        .filter_map(|a| Some((a["name"].as_str()?, a["browser_download_url"].as_str()?)))
+        .collect();
+    assets
+        .iter()
+        .filter(|(name, _)| name.ends_with(".zip"))
+        .find(|(name, _)| assets.iter().any(|(sig, _)| sig.strip_suffix(".minisig") == Some(*name)))
+        .map(|(_, url)| (latest.to_string(), url.to_string()))
 }
 
 /// 업데이트 zip 을 받아도 되는 주소: 이 리포 릴리스의 첨부 파일. 정규화(`..`·`%2e%2e` 등)로 경로가 바뀌는 주소는 거부한다
@@ -2836,11 +2848,20 @@ fn is_release_asset_url(url: &str) -> bool {
     }
 }
 
-/// 업데이트 zip 을 받는 클라이언트. GitHub 은 다른 호스트(objects.githubusercontent.com 등)로 보내므로
+/// 업데이트 확인·서명·zip 을 받는 클라이언트. GitHub 은 다른 호스트(objects.githubusercontent.com 등)로 보내므로
 /// 리다이렉트 호스트는 제한하지 않고 https 만 따라간다
 fn update_client() -> Result<Client, String> {
+    update_client_with(UPDATE_CONNECT_TIMEOUT, UPDATE_STALL_TIMEOUT)
+}
+
+/// `stall`: reqwest blocking 의 클라이언트 timeout 은 전체 시간이 아니라 응답 헤더 기다림과 본문 `read()` 한 번마다
+/// 적용된다(0.12 blocking 에는 read_timeout 이 없음). 그래서 zip 처럼 오래 걸리는 내려받기에는 "멈춤" 타임아웃이 된다.
+/// 전체 시간을 제한할 요청(API·서명 파일)은 요청마다 `.timeout(UPDATE_REQUEST_TIMEOUT)` 을 붙인다
+fn update_client_with(connect: Duration, stall: Duration) -> Result<Client, String> {
     Client::builder()
         .user_agent(format!("url-downloader/{VERSION}"))
+        .connect_timeout(connect)
+        .timeout(stall)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if redirect_allowed(attempt.url().scheme(), attempt.previous().len()) {
                 attempt.follow()
@@ -2930,15 +2951,11 @@ fn verify_update_signature<R: Read>(
     file_name: &str,
     open: impl Fn() -> std::io::Result<R>,
 ) -> Result<(), String> {
-    use minisign_verify::{PublicKey, Signature};
+    use minisign_verify::PublicKey;
     if keys.is_empty() {
         return Err("업데이트 서명 키가 설정되지 않아 설치하지 않습니다".to_string());
     }
-    if sig.len() as u64 > MAX_SIGNATURE_BYTES {
-        return Err(format!("서명 파일이 크기 상한({MAX_SIGNATURE_BYTES} 바이트)을 넘습니다"));
-    }
-    let text = std::str::from_utf8(sig).map_err(|_| "서명 파일 형식이 올바르지 않습니다".to_string())?;
-    let signature = Signature::decode(text).map_err(|e| format!("서명 파일 형식이 올바르지 않습니다: {e}"))?;
+    let signature = decode_update_signature(sig)?;
     let mut last_err = "설정된 서명 키와 맞지 않습니다".to_string();
     let mut verified = false;
     for key in keys {
@@ -2973,9 +2990,18 @@ fn verify_update_signature<R: Read>(
     Ok(())
 }
 
-/// 서명 파일을 받는다 (https 전용 업데이트 클라이언트, 크기 상한 MAX_SIGNATURE_BYTES)
-fn fetch_update_signature(client: &Client, sig_url: &str) -> Result<Vec<u8>, String> {
-    let resp = client.get(sig_url).send().map_err(|e| e.to_string())?;
+/// 서명 파일의 크기·형식 확인 (검증 전, 내용과 무관). zip 을 받기 전에도 쓴다
+fn decode_update_signature(sig: &[u8]) -> Result<minisign_verify::Signature, String> {
+    if sig.len() as u64 > MAX_SIGNATURE_BYTES {
+        return Err(format!("서명 파일이 크기 상한({MAX_SIGNATURE_BYTES} 바이트)을 넘습니다"));
+    }
+    let text = std::str::from_utf8(sig).map_err(|_| "서명 파일 형식이 올바르지 않습니다".to_string())?;
+    minisign_verify::Signature::decode(text).map_err(|e| format!("서명 파일 형식이 올바르지 않습니다: {e}"))
+}
+
+/// 서명 파일을 받는다 (https 전용 업데이트 클라이언트, 크기 상한 MAX_SIGNATURE_BYTES, 전체 타임아웃 `total`)
+fn fetch_update_signature(client: &Client, sig_url: &str, total: Duration) -> Result<Vec<u8>, String> {
+    let resp = client.get(sig_url).timeout(total).send().map_err(|e| e.to_string())?;
     if resp.status() == StatusCode::NOT_FOUND {
         return Err("릴리스에 서명 파일이 없습니다".to_string());
     }
@@ -3007,18 +3033,62 @@ fn install_update_with_keys(
     let file_name = check_update_target(url, expected_version, VERSION)?;
     let sig_url = update_signature_url(url).ok_or_else(|| format!("서명 파일 주소가 공식 릴리스 주소가 아닙니다: {url}"))?;
     if keys.is_empty() {
-        return Err("업데이트 서명 키가 설정되지 않아 설치하지 않습니다".to_string());
+        return Err(format!("업데이트 서명 키가 설정되지 않아 설치하지 않습니다. {MANUAL_UPDATE_HINT}"));
     }
     let bundle = current_bundle()?;
-    let work = std::env::temp_dir().join(format!("url-downloader-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    // 다른 사용자·프로세스가 미리 만들어 둘 수 없는 새 폴더(임의 이름, 0700)에서만 작업한다
+    let work = new_update_work_dir()?;
     // 성공·실패 모두 받은 zip·서명·압축 푼 것을 지운다
     let result = download_verify_replace(url, &sig_url, file_name, keys, &bundle, &work, set);
     let _ = std::fs::remove_dir_all(&work);
     result
 }
 
+/// 업데이트 작업 폴더: 임시 폴더 안에 `url-downloader-update-<임의 문자열>` 을 새로 만든다
+fn new_update_work_dir() -> Result<PathBuf, String> {
+    create_private_dir(&std::env::temp_dir(), "url-downloader-update-", random_suffix)
+}
+
+/// `parent/<prefix><suffix()>` 폴더를 권한 0700 으로 새로 만든다. 이미 있으면(폴더·파일·심볼릭 링크 모두) 쓰지 않고
+/// 다른 이름으로 다시 시도한다. 기존 경로를 받아들이는 경우는 없다
+fn create_private_dir(parent: &Path, prefix: &str, mut suffix: impl FnMut() -> String) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    for _ in 0..16 {
+        let dir = parent.join(format!("{prefix}{}", suffix()));
+        // mkdir 은 경로가 이미 있으면(심볼릭 링크 포함) 실패한다
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {
+                // umask 와 무관하게 0700
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| format!("임시 폴더 권한을 설정하지 못했습니다: {e}"))?;
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("임시 폴더를 만들지 못했습니다: {e}")),
+        }
+    }
+    Err("임시 폴더를 새로 만들지 못했습니다 (이름이 계속 겹침)".to_string())
+}
+
+/// 임시 폴더 이름용 임의 문자열 (32자리 16진수). /dev/urandom 을 못 읽으면 OS 난수로 시드되는 RandomState 해시를 쓴다
+fn random_suffix() -> String {
+    let mut bytes = [0u8; 16];
+    if File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
+        use std::hash::{BuildHasher, Hasher};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        for half in bytes.chunks_mut(8) {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+            h.write_u32(std::process::id());
+            h.write_u64(COUNTER.fetch_add(1, Relaxed));
+            half.copy_from_slice(&h.finish().to_le_bytes());
+        }
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 서명 파일 → zip → 검증 → 압축 풀기 → 번들 교체. 주소·버전·키 검사는 호출하는 `install_update_with_keys` 가 먼저 한다
+/// (이 함수는 받은 주소를 그대로 요청하므로 공개 진입점에서 직접 부르지 않는다. 테스트는 로컬 서버 주소로 부른다)
 fn download_verify_replace(
     url: &str,
     sig_url: &str,
@@ -3030,8 +3100,15 @@ fn download_verify_replace(
 ) -> Result<PathBuf, String> {
     let zip = work.join("update.zip");
     let client = update_client()?;
+    const SIG_FAIL: &str = "업데이트 파일의 서명을 확인할 수 없어 설치하지 않습니다";
+    let sig_fail = |e: String| format!("{SIG_FAIL}: {e}. {MANUAL_UPDATE_HINT}");
 
     set(UpdateState::Downloading { done: 0, total: None });
+    // 서명 파일을 먼저 받아 크기·형식을 확인한다. 서명이 없는 릴리스면 큰 zip 을 받기 전에 끝난다
+    let sig = fetch_update_signature(&client, sig_url, UPDATE_REQUEST_TIMEOUT).map_err(sig_fail)?;
+    decode_update_signature(&sig).map_err(sig_fail)?;
+
+    // zip 은 전체 시간 제한 없이, 멈춤 타임아웃(UPDATE_STALL_TIMEOUT)만으로 받는다
     let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -3052,9 +3129,7 @@ fn download_verify_replace(
     drop(file);
 
     // 검증 전에는 zip 을 풀거나 실행하지 않는다
-    const SIG_FAIL: &str = "업데이트 파일의 서명을 확인할 수 없어 설치하지 않습니다";
-    let sig = fetch_update_signature(&client, sig_url).map_err(|e| format!("{SIG_FAIL}: {e}"))?;
-    verify_update_signature(keys, &sig, file_name, || File::open(&zip)).map_err(|e| format!("{SIG_FAIL}: {e}"))?;
+    verify_update_signature(keys, &sig, file_name, || File::open(&zip)).map_err(sig_fail)?;
 
     set(UpdateState::Installing);
     let extracted = work.join("extracted");
@@ -3772,6 +3847,332 @@ wok80NKOs9bx2ACBaXBDj6RApPAnO88LAdqCEPNMY6TGvjUflvzU14IqV2io9nsgNA402XAm+LAzeNX2
         .unwrap_err();
         assert!(err.contains("현재 버전"), "오류 문구: {err}");
         assert_eq!(started.load(SeqCst), 0, "내려받기를 시작하면 안 된다");
+    }
+
+    // 릴리스 전용 검사 (Release 워크플로·scripts/release.sh 가 `-- --ignored` 로 실행). 평소 테스트에서는 건너뛴다.
+    // 키가 비어 있거나 하나뿐이면 릴리스하지 않는다: 주 키를 잃어도 예비 키로 다음 업데이트를 낼 수 있어야 한다
+    #[test]
+    #[ignore = "릴리스 전용: cargo test --locked release_keys_are_configured -- --ignored"]
+    fn release_keys_are_configured() {
+        use minisign_verify::PublicKey;
+        assert!(
+            UPDATE_PUBLIC_KEYS.len() >= 2,
+            "UPDATE_PUBLIC_KEYS(src/main.rs)에 주 키·예비 키를 2개 이상 넣어야 릴리스할 수 있습니다 (지금 {}개)",
+            UPDATE_PUBLIC_KEYS.len()
+        );
+        let keys: Vec<PublicKey> = UPDATE_PUBLIC_KEYS
+            .iter()
+            .map(|k| PublicKey::from_base64(k).unwrap_or_else(|e| panic!("UPDATE_PUBLIC_KEYS 의 공개키를 읽지 못했습니다 ({k}): {e}")))
+            .collect();
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert!(a != b, "UPDATE_PUBLIC_KEYS 에 같은 키가 두 번 들어 있습니다");
+            }
+        }
+    }
+
+    // ---- 릴리스 API: 서명 파일이 함께 있는 릴리스만 업데이트로 제안 ----
+    fn release_json(tag: &str, assets: &[&str]) -> serde_json::Value {
+        let assets: Vec<serde_json::Value> = assets
+            .iter()
+            .map(|n| serde_json::json!({ "name": n, "browser_download_url": format!("{V}/{tag}/{n}") }))
+            .collect();
+        serde_json::json!({ "tag_name": tag, "assets": assets })
+    }
+
+    #[test]
+    fn latest_release_requires_zip_and_matching_signature() {
+        let zip = "URL-Downloader-v0.6.0-macos-universal.zip";
+        let sig = "URL-Downloader-v0.6.0-macos-universal.zip.minisig";
+        assert_eq!(
+            latest_release_from_json(&release_json("v0.6.0", &[zip, sig]), "0.5.0"),
+            Some(("0.6.0".to_string(), format!("{V}/v0.6.0/{zip}")))
+        );
+        // 순서가 달라도 짝을 찾는다
+        assert!(latest_release_from_json(&release_json("v0.6.0", &[sig, zip]), "0.5.0").is_some());
+        // 서명이 아직 없음(서명 전 상태) / 다른 파일의 서명 / zip 없음 → 최신 상태와 같은 취급
+        for assets in [
+            vec![zip],
+            vec![zip, "URL-Downloader-v0.5.0-macos-universal.zip.minisig"],
+            vec![zip, "URL-Downloader-v0.6.0-macos-universal.minisig"],
+            vec![sig],
+            vec![],
+        ] {
+            assert_eq!(latest_release_from_json(&release_json("v0.6.0", &assets), "0.5.0"), None, "{assets:?}");
+        }
+        // 서명된 zip 이 여러 개면 서명이 있는 쪽을 고른다
+        let other = "URL-Downloader-v0.6.0-macos-arm64.zip";
+        assert_eq!(
+            latest_release_from_json(&release_json("v0.6.0", &[other, zip, sig]), "0.5.0").map(|(_, u)| u),
+            Some(format!("{V}/v0.6.0/{zip}"))
+        );
+        // 현재 버전 이하이면 서명이 있어도 None
+        assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[zip, sig]), "0.6.0"), None);
+    }
+
+    // ---- 업데이트 임시 폴더 ----
+    #[test]
+    fn update_work_dir_is_new_random_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = new_update_work_dir().unwrap();
+        let b = new_update_work_dir().unwrap();
+        assert_ne!(a, b, "매번 다른 이름이어야 한다");
+        for d in [&a, &b] {
+            let name = d.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name.starts_with("url-downloader-update-"), "{name}");
+            assert_ne!(name, format!("url-downloader-update-{}", std::process::id()), "pid 로 예측할 수 있으면 안 된다");
+            let meta = std::fs::symlink_metadata(d).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{}", d.display());
+            assert_eq!(std::fs::read_dir(d).unwrap().count(), 0, "새로 만든 빈 폴더여야 한다");
+        }
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn private_dir_never_reuses_existing_path() {
+        let parent = std::env::temp_dir().join(format!("ud_privdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        // 이미 있는 폴더, 다른 곳을 가리키는 심볼릭 링크는 건너뛰고 건드리지 않는다
+        std::fs::create_dir(parent.join("p-taken")).unwrap();
+        std::fs::write(parent.join("p-taken/keep.txt"), b"keep").unwrap();
+        let elsewhere = parent.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, parent.join("p-link")).unwrap();
+        let mut names = vec!["taken", "link", "fresh"].into_iter();
+        let dir = create_private_dir(&parent, "p-", || names.next().unwrap().to_string()).unwrap();
+        assert_eq!(dir, parent.join("p-fresh"));
+        assert_eq!(std::fs::read(parent.join("p-taken/keep.txt")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        // 계속 겹치면 기존 폴더를 쓰지 않고 실패한다
+        assert!(create_private_dir(&parent, "p-", || "taken".to_string()).is_err());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    // ---- 내려받기 → 검증 → 교체 순서 (로컬 서버, 임시 번들) ----
+    // TEST ONLY: testdata/update-test.zip(New.app/Contents/marker.txt 하나)을 비밀번호 없는 일회용 키로 서명한 것.
+    // 비밀키는 서명 직후 지웠고 리포에 없다. 실제 업데이트 서명 키와 무관하다
+    const TEST_KEY_ZIP: &str = "RWRYwUrVRiA9SgFGG8bNfY3Gi1B2hoBDh1msalNucnEMtlfc2a4Xn1ys";
+    const TEST_ZIP: &[u8] = include_bytes!("../testdata/update-test.zip");
+    const TEST_ZIP_SIG: &str = "untrusted comment: signature from minisign secret key
+RURYwUrVRiA9StBfdntD0PhPXBombhIIuX9cYWmbfRyUgvXAf3vrf7TLYO1Bn+3333gS/B9HyzO5NMgiYR/M9COzWviGw6OqRQY=
+trusted comment: file:URL-Downloader-v0.6.0-macos-universal.zip
+W6qHkE+RLhdmmhbWdVNyk+7dC884pEubSvte5CWAvu/c+I0zQX3abo3Qu1NCalW7iRBHbfKR0iVuixcLPuNJDA==
+";
+
+    /// 경로별로 정해진 상태·본문을 주는 서버. 요청한 경로를 순서대로 기록한다
+    fn serve_routes(routes: Vec<(&'static str, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let l = Arc::clone(&log);
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut reader = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    line.clear();
+                }
+                l.lock().unwrap().push(path.clone());
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, _, _)| *p == path)
+                    .map(|(_, st, b)| (*st, b.clone()))
+                    .unwrap_or((404, Vec::new()));
+                let head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), log)
+    }
+
+    struct Sandbox {
+        root: PathBuf,
+        bundle: PathBuf,
+        work: PathBuf,
+    }
+
+    /// 임시 폴더에 기존 번들(`URL Downloader.app/Contents/marker.txt` = old)과 빈 작업 폴더를 만든다
+    fn sandbox(tag: &str) -> Sandbox {
+        let root = std::env::temp_dir().join(format!("ud_dvr_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("URL Downloader.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/marker.txt"), b"old bundle\n").unwrap();
+        let work = root.join("work");
+        std::fs::create_dir(&work).unwrap();
+        Sandbox { root, bundle, work }
+    }
+
+    impl Sandbox {
+        fn marker(&self) -> Vec<u8> {
+            std::fs::read(self.bundle.join("Contents/marker.txt")).unwrap()
+        }
+        fn assert_untouched(&self) {
+            assert_eq!(self.marker(), b"old bundle\n", "기존 번들이 그대로여야 한다");
+            assert!(!self.work.join("extracted").exists(), "압축을 풀면 안 된다");
+            assert!(!self.bundle.with_extension("app.old").exists());
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn run_dvr(sb: &Sandbox, base: &str, file_name: &str, keys: &[&str]) -> Result<PathBuf, String> {
+        download_verify_replace(
+            &format!("{base}/update.zip"),
+            &format!("{base}/update.zip.minisig"),
+            file_name,
+            keys,
+            &sb.bundle,
+            &sb.work,
+            &|_| {},
+        )
+    }
+
+    #[test]
+    fn update_signature_missing_stops_before_zip_download() {
+        let sb = sandbox("nosig");
+        let (base, log) = serve_routes(vec![("/update.zip", 200, TEST_ZIP.to_vec())]);
+        let err = run_dvr(&sb, &base, TEST_FILE, &[TEST_KEY_ZIP]).unwrap_err();
+        assert!(err.contains("서명 파일이 없습니다"), "오류 문구: {err}");
+        assert!(err.contains("릴리스 페이지"), "직접 받는 안내가 있어야 한다: {err}");
+        assert_eq!(*log.lock().unwrap(), vec!["/update.zip.minisig".to_string()], "서명이 없으면 zip 을 받지 않는다");
+        assert!(!sb.work.join("update.zip").exists());
+        sb.assert_untouched();
+    }
+
+    #[test]
+    fn update_signature_unparsable_or_oversized_stops_before_zip_download() {
+        let big = vec![b'a'; MAX_SIGNATURE_BYTES as usize + 1];
+        for sig in [b"not a signature".to_vec(), big] {
+            let sb = sandbox("badfmt");
+            let (base, log) = serve_routes(vec![("/update.zip", 200, TEST_ZIP.to_vec()), ("/update.zip.minisig", 200, sig)]);
+            let err = run_dvr(&sb, &base, TEST_FILE, &[TEST_KEY_ZIP]).unwrap_err();
+            assert!(err.contains("릴리스 페이지"), "오류 문구: {err}");
+            assert_eq!(*log.lock().unwrap(), vec!["/update.zip.minisig".to_string()], "zip 을 받으면 안 된다");
+            sb.assert_untouched();
+        }
+    }
+
+    #[test]
+    fn update_wrong_signature_keeps_bundle_and_does_not_extract() {
+        // 형식은 맞지만 다른 내용의 서명 (키는 맞음) / 모르는 키의 서명
+        for (sig, keys) in [(TEST_SIG_A, &[TEST_KEY_A][..]), (TEST_ZIP_SIG, &[TEST_KEY_A][..])] {
+            let sb = sandbox("wrongsig");
+            let (base, log) = serve_routes(vec![
+                ("/update.zip", 200, TEST_ZIP.to_vec()),
+                ("/update.zip.minisig", 200, sig.as_bytes().to_vec()),
+            ]);
+            let err = run_dvr(&sb, &base, TEST_FILE, keys).unwrap_err();
+            assert!(err.contains("서명을 확인할 수 없어"), "오류 문구: {err}");
+            assert!(err.contains("릴리스 페이지"), "오류 문구: {err}");
+            assert_eq!(log.lock().unwrap().first().map(String::as_str), Some("/update.zip.minisig"), "서명을 먼저 받는다");
+            sb.assert_untouched();
+        }
+    }
+
+    #[test]
+    fn update_signature_for_other_file_name_keeps_bundle() {
+        let sb = sandbox("othername");
+        let (base, _) = serve_routes(vec![
+            ("/update.zip", 200, TEST_ZIP.to_vec()),
+            ("/update.zip.minisig", 200, TEST_ZIP_SIG.as_bytes().to_vec()),
+        ]);
+        let err = run_dvr(&sb, &base, "URL-Downloader-v0.7.0-macos-universal.zip", &[TEST_KEY_ZIP]).unwrap_err();
+        assert!(err.contains("파일명"), "오류 문구: {err}");
+        sb.assert_untouched();
+    }
+
+    #[test]
+    fn update_with_valid_signature_replaces_bundle() {
+        let sb = sandbox("good");
+        let (base, log) = serve_routes(vec![
+            ("/update.zip", 200, TEST_ZIP.to_vec()),
+            ("/update.zip.minisig", 200, TEST_ZIP_SIG.as_bytes().to_vec()),
+        ]);
+        let out = run_dvr(&sb, &base, TEST_FILE, &[TEST_KEY_ZIP]).unwrap();
+        assert_eq!(out, sb.bundle);
+        assert_eq!(sb.marker(), b"TEST ONLY new bundle\n", "새 번들로 바뀌어야 한다");
+        assert!(!sb.bundle.with_extension("app.old").exists(), "치운 기존 번들은 지운다");
+        assert_eq!(*log.lock().unwrap(), vec!["/update.zip.minisig".to_string(), "/update.zip".to_string()]);
+    }
+
+    // ---- 타임아웃 (설치된 reqwest blocking 의 동작을 확인) ----
+    /// 헤더를 보낸 뒤 본문 10 바이트를 `gaps_ms` 간격으로 한 바이트씩 보낸다
+    fn serve_drip(gaps_ms: Vec<u64>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let gaps = gaps_ms.clone();
+                thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(s.try_clone().unwrap());
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                        line.clear();
+                    }
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", gaps.len()).as_bytes());
+                    let _ = s.flush();
+                    for g in gaps {
+                        thread::sleep(Duration::from_millis(g));
+                        if s.write_all(b"x").and_then(|_| s.flush()).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = s.shutdown(Shutdown::Both);
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn read_all(client: &Client, url: &str) -> Result<usize, String> {
+        let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        resp.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        Ok(buf.len())
+    }
+
+    #[test]
+    fn update_zip_download_uses_stall_timeout_not_total() {
+        let client = update_client_with(Duration::from_secs(5), Duration::from_millis(500)).unwrap();
+        // 꾸준히 오면 정지 타임아웃(0.5초)보다 오래 걸려도(약 1초) 끝까지 받는다
+        assert_eq!(read_all(&client, &serve_drip(vec![100; 10])), Ok(10));
+        // 중간에 2초 멈추면 실패한다
+        let mut gaps = vec![50; 10];
+        gaps[3] = 2000;
+        let started = Instant::now();
+        assert!(read_all(&client, &serve_drip(gaps)).is_err(), "멈춘 연결은 끊어야 한다");
+        assert!(started.elapsed() < Duration::from_millis(1800), "정지 타임아웃에서 끊어야 한다: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn update_signature_fetch_uses_total_timeout() {
+        let client = update_client_with(Duration::from_secs(5), Duration::from_secs(5)).unwrap();
+        // 한 바이트씩 꾸준히 와도(정지 없음) 전체 시간이 넘으면 실패한다
+        let url = format!("{}/x.minisig", serve_drip(vec![100; 10]));
+        let started = Instant::now();
+        assert!(fetch_update_signature(&client, &url, Duration::from_millis(400)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(900), "전체 타임아웃에서 끊어야 한다: {:?}", started.elapsed());
+        assert_eq!(fetch_update_signature(&client, &url, Duration::from_secs(5)).map(|b| b.len()), Ok(10));
+    }
+
+    #[test]
+    fn install_update_errors_point_to_release_page() {
+        let url = format!("{V}/v99.0.0/URL-Downloader-v99.0.0-macos-universal.zip");
+        let err = install_update_with_keys(&url, Some("99.0.0"), &[], &|_| {}).unwrap_err();
+        assert!(err.contains("서명 키") && err.contains("릴리스 페이지"), "오류 문구: {err}");
     }
 
     // 알림 문구는 AppleScript 문자열 안에 들어간다: 역슬래시를 먼저 두 배로, 큰따옴표는 작은따옴표로

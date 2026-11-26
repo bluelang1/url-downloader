@@ -1,11 +1,13 @@
 name: Release
+# 태그에서 검증만 한다 (테스트·서명 키 설정·universal 번들 빌드). 아무것도 게시하지 않는다.
+# 릴리스 zip 은 개발자 컴퓨터에서 scripts/release.sh 가 태그 소스로 직접 빌드·서명해 릴리스를 만든다.
+# 그래서 이 워크플로(와 GitHub 토큰)가 바뀌어도 서명된 업데이트를 만들 수 없다
 on:
   push:
     tags: ['v*']
 permissions:
   contents: read
 jobs:
-  # 테스트·번들까지는 읽기 권한만으로 한다
   build:
     runs-on: macos-latest
     permissions:
@@ -22,26 +24,9 @@ jobs:
         run: |
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ "v$V" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml v$V"; exit 1; }
+      # UPDATE_PUBLIC_KEYS 가 비었거나 하나뿐이거나 읽을 수 없으면 실패 (서명해도 앱이 설치하지 못하는 릴리스 방지)
+      - name: Check update signing keys are configured
+        run: cargo test --locked release_keys_are_configured -- --ignored
       - run: cargo test --locked
-      - run: UNIVERSAL=1 INSTALL=0 ./bundle.sh
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-zip
-          path: dist/*.zip
-          if-no-files-found: error
-          retention-days: 1
-  # 쓰기 권한은 릴리스 생성에만. 리포 코드는 체크아웃하지 않는다
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-zip
-          path: dist
-      - name: Create GitHub release with .app zip
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.zip --repo "$GITHUB_REPOSITORY" --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes
+      - name: Check universal bundle builds
+        run: UNIVERSAL=1 INSTALL=0 ./bundle.sh
