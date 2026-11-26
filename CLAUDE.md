@@ -21,7 +21,7 @@
 - 화면 확인은 `HOME=<임시 폴더>` 로 실행해 실제 설정·자격증명을 건드리지 않음. 실제 AWS 호출과 MFA 입력은 사용자가 직접
 
 ## 릴리스 (승인 후에만)
-- 절차: Cargo.toml version 올림 → `cargo about generate ...` 로 고지 파일 갱신(버전 표기) → `git tag vX.Y.Z` → main+태그 푸시. Release 워크플로가 build → sign → verify → publish 로 서명된 릴리스를 공개. 태그는 vX.Y.Z 만(사전 릴리스 태그 금지)
+- 절차: Cargo.toml version 올림 → `cargo about generate ...` 로 고지 파일 갱신(버전 표기) → `cargo audit`(취약점이 있으면 고친 뒤 진행. 예외는 사유와 함께 `.cargo/audit.toml`) → `git tag vX.Y.Z` → main+태그 푸시. Release 워크플로가 build → sign → verify → publish 로 서명된 릴리스를 공개. 태그는 vX.Y.Z 만(사전 릴리스 태그 금지)
 - 서명 키는 GitHub 환경 `release`(태그 `v*` 전용)의 시크릿에만 있고 로컬 사본은 없음: `MINISIGN_KEY`/`MINISIGN_PASSWORD`(주), `MINISIGN_SPARE_KEY`/`MINISIGN_SPARE_PASSWORD`(예비, 워크플로 미사용). 시크릿은 다시 읽을 수 없으니 환경·시크릿을 지우거나 덮어쓰지 말 것(기존 설치본의 자동 업데이트가 끊김)
 - 워크플로 권한 분리를 깨지 말 것: 시크릿은 `sign` 만(쓰기 토큰·체크아웃 없음), 쓰기 토큰은 `publish` 만(시크릿·체크아웃 없음), 리포 코드는 `build`·`verify` 만 실행. 상세는 release.yml 머리 주석. 액션은 커밋 SHA 고정(올릴 때 `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` 로 조회)
 - 앱의 `UPDATE_PUBLIC_KEYS`(src/main.rs)는 위 두 키의 공개키. 바꾸면 기존 설치본이 새 릴리스를 설치하지 못함. 비었거나 1개면 build 가 실패(`security_tests::release_keys_are_configured`)

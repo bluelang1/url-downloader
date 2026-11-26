@@ -42,6 +42,11 @@ jobs:
             || { echo "tag ${GITHUB_REF_NAME} is not vX.Y.Z"; exit 1; }
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ "v$V" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml v$V"; exit 1; }
+      # 알려진 취약점이 있는 의존성으로는 릴리스하지 않는다. 예외는 사유와 함께 .cargo/audit.toml 에만 둔다
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.23.0
+          cargo audit
       # UPDATE_PUBLIC_KEYS 가 비었거나 하나뿐이거나 읽을 수 없으면 실패 (서명해도 앱이 설치하지 못하는 릴리스 방지).
       # 테스트 이름을 정확히 지정하고, 실제로 1개가 통과했는지까지 확인한다 (필터가 틀려 0개 실행으로 통과하는 것 방지)
       - name: Check update signing keys are configured

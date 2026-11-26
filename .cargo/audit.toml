@@ -1,0 +1,8 @@
+# cargo audit 예외. 항목마다 사유를 적는다. 사유가 사라지면 지운다
+[advisories]
+ignore = [
+    # quick-xml 0.30.0: 리눅스 전용 경로(zbus_xml ← accesskit 의 atspi)에만 있고 macOS 빌드에는 들어가지 않는다.
+    # 확인: cargo tree --target aarch64-apple-darwin -i quick-xml@0.30.0 → "nothing to print"
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
