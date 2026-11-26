@@ -1,8 +1,12 @@
 #!/bin/sh
-# 릴리스를 개발자 컴퓨터에서 만든다: 키 확인 → 서명할 커밋 확인(태그 이름 입력) → 태그 소스를 깨끗한 작업 폴더에서 빌드
+# 비상용: 릴리스를 개발자 컴퓨터에서 만든다. 평소에는 태그를 푸시하면 Release 워크플로가
+# build → sign → verify → publish 로 빌드·서명·게시하므로 이 스크립트를 쓰지 않는다.
+# CI 가 서명·게시하지 못했을 때(시크릿 문제, GitHub Actions 장애 등)만, 같은 서명 키의 로컬 사본으로 실행한다.
+# 순서: 키 확인 → 서명할 커밋 확인(태그 이름 입력) → 태그 소스를 깨끗한 작업 폴더에서 빌드
 # → minisign 서명 → 태그 소스의 앱 코드로 검증 → 초안 릴리스 → 공개.
 #   scripts/release.sh vX.Y.Z   (터미널에서 사람이 직접 실행. 확인을 건너뛰는 옵션은 없다)
-# 신뢰의 뿌리는 이 컴퓨터의 서명 키다. CI(Release 워크플로)는 같은 태그를 검증만 하고 아무것도 게시하지 않으며,
+# 그 태그의 Release 워크플로 build 작업(테스트·번들 빌드)이 성공했어야 한다. 워크플로가 게시까지 성공했다면
+# 릴리스가 이미 있어 이 스크립트는 중단되는 것이 정상이다.
 # 이 스크립트는 CI 가 만든 파일을 받지 않는다 (서명할 zip 은 여기서 직접 빌드한다).
 # 비밀키 비밀번호는 minisign 이 터미널에서 직접 묻는다 (이 스크립트는 읽지 않는다).
 # 키 위치를 바꾸려면 URL_DOWNLOADER_SIGN_KEY / URL_DOWNLOADER_SIGN_PUB 를 지정한다.
@@ -63,16 +67,21 @@ fi
 [ "$REMOTE" = "$LOCAL" ] || die "로컬 태그($LOCAL)와 원격 태그($REMOTE)가 다른 커밋입니다"
 echo "태그:   $TAG ($LOCAL)"
 
-# ---- c. 같은 커밋에서 Release 워크플로(검증 전용)가 성공했는지 ----
+# ---- c. 같은 커밋에서 Release 워크플로가 끝났고 그 build 작업(테스트·번들 빌드)이 성공했는지 ----
+# 비상용이므로 sign·verify·publish 의 실패는 허용한다. 워크플로 전체가 성공했다면 이미 게시되어 아래 릴리스 확인에서 멈춘다
 RUN=$(gh run list --repo "$REPO" --workflow Release --branch "$TAG" --limit 1 \
-  --json status,conclusion,headSha --jq '.[0] | select(.) | "\(.status) \(.conclusion) \(.headSha)"') \
+  --json databaseId,status,conclusion,headSha --jq '.[0] | select(.) | "\(.databaseId) \(.status) \(.conclusion) \(.headSha)"') \
   || die "Release 워크플로 실행 기록을 확인하지 못했습니다 (gh auth status 확인)"
 [ -n "$RUN" ] || die "태그 $TAG 의 Release 워크플로 실행 기록이 없습니다"
 set -- $RUN
-[ "$1" = "completed" ] || die "태그 $TAG 의 Release 워크플로가 아직 끝나지 않았습니다 ($1)"
-[ "$2" = "success" ] || die "태그 $TAG 의 Release 워크플로가 성공하지 않았습니다 ($2)"
-[ "${3:-}" = "$LOCAL" ] || die "Release 워크플로가 검증한 커밋(${3:-?})이 태그 커밋과 다릅니다"
-echo "CI:     Release 워크플로 성공"
+RUN_ID=$1
+[ "${2:-}" = "completed" ] || die "태그 $TAG 의 Release 워크플로가 아직 끝나지 않았습니다 (${2:-?}). 끝난 뒤 게시됐는지 먼저 확인하세요"
+RUN_CONCLUSION=${3:-?}
+[ "${4:-}" = "$LOCAL" ] || die "Release 워크플로가 검증한 커밋(${4:-?})이 태그 커밋과 다릅니다"
+BUILD=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs --jq '.jobs[] | select(.name == "build") | .conclusion') \
+  || die "Release 워크플로의 작업 결과를 확인하지 못했습니다 (gh auth status 확인)"
+[ "$BUILD" = "success" ] || die "태그 $TAG 의 Release 워크플로 build 작업이 성공하지 않았습니다 (${BUILD:-없음})"
+echo "CI:     Release 워크플로 build 성공 (워크플로 전체: $RUN_CONCLUSION)"
 
 # 같은 태그의 릴리스가 이미 있으면(초안 포함) 멈춘다. 태그 조회(gh release view)는 초안을 최근 것만 찾으므로
 # 릴리스 목록 전체에서 tag_name 으로 찾는다
@@ -82,8 +91,8 @@ check_no_release() {
     || die "릴리스 목록을 확인하지 못했습니다 (gh auth status 확인)"
   case "$STATE" in
     "") ;;
-    *draft*) die "초안이 남아 있습니다 ($TAG). GitHub 에서 지운 뒤 다시 실행하세요" ;;
-    *) die "릴리스 $TAG 가 이미 있습니다" ;;
+    *draft*) die "초안이 남아 있습니다 ($TAG). Release 워크플로가 게시 중이 아닌지 확인하고, GitHub 에서 지운 뒤 다시 실행하세요" ;;
+    *) die "릴리스 $TAG 가 이미 있습니다 (Release 워크플로가 게시했다면 정상입니다. 이 스크립트는 CI 가 게시하지 못했을 때만 씁니다)" ;;
   esac
 }
 check_no_release

@@ -4042,7 +4042,7 @@ wok80NKOs9bx2ACBaXBDj6RApPAnO88LAdqCEPNMY6TGvjUflvzU14IqV2io9nsgNA402XAm+LAzeNX2
         assert_eq!((code, line), (1, "error: HTTP 403".to_string()));
     }
 
-    // 릴리스 전용 검사: scripts/release.sh 가 서명한 zip 을 태그 소스의 앱 코드로 검증한다 (평소 테스트에서는 건너뜀).
+    // 릴리스 전용 검사: Release 워크플로(verify)·scripts/release.sh 가 서명한 zip 을 태그 소스의 앱 코드로 검증한다 (평소 테스트에서는 건너뜀).
     // 릴리스 API 응답에서 고르기(정해진 zip 이름·서명 짝·크기 상한) → 주소·태그·파일명 버전 → UPDATE_PUBLIC_KEYS 로 서명·trusted comment
     #[test]
     #[ignore = "릴리스 전용: URL_DOWNLOADER_VERIFY_ZIP=<zip> cargo test --locked -- --ignored --exact security_tests::release_artifact_verifies"]
