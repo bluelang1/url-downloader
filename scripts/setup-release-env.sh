@@ -9,6 +9,7 @@
 #   4. 환경 시크릿 MINISIGN_PASSWORD = 비밀키 비밀번호 (gh 가 터미널에서 직접 묻는다. 이 스크립트는 읽지 않는다)
 # 예비 키는 GitHub 에 올리지 않는다 (주 키가 유출됐을 때 교체용). 필요하면 환경 설정 화면에서 승인자(required reviewers)를
 # 추가해 서명 전에 사람이 승인하게 할 수 있다.
+# 주의: 승인자를 추가한 뒤 이 스크립트를 다시 실행하면 환경 설정을 다시 쓰면서 승인자가 지워질 수 있다. 다시 실행했다면 환경 설정 화면을 확인한다.
 set -eu
 
 REPO=bluelang1/url-downloader
@@ -38,6 +39,9 @@ gh auth status >/dev/null 2>&1 || die "gh 로그인이 필요합니다 (gh auth 
 FIRST=$(head -n 1 "$KEY")
 [ "$FIRST" = "untrusted comment: minisign encrypted secret key" ] \
   || die "비밀번호로 암호화된 minisign 비밀키가 아닙니다 (첫 줄: $FIRST): $KEY"
+# 비밀번호 없이 만든(-W) 키도 첫 줄은 같다. 둘째 줄의 KDF 표시(3~4번째 바이트)가 Sc(scrypt)여야 비밀번호로 잠긴 키다
+KDF=$(sed -n 2p "$KEY" | base64 -d 2>/dev/null | head -c 4 | cut -c3-4)
+[ "$KDF" = "Sc" ] || die "비밀번호 없이 만든 키입니다. 비밀번호를 설정해 다시 만드세요: $KEY"
 
 echo "리포:   $REPO"
 echo "환경:   $ENV_NAME"
