@@ -1,7 +1,7 @@
 # URL Downloader (Rust/egui, macOS)
 
 ## 검증
-- `cargo test` - 62개, ~5초. 로컬 Range 서버로 분할·이어받기까지 검증
+- `cargo test --locked` - 68개, ~5초. 로컬 Range 서버로 분할·이어받기까지 검증
 - `cargo build --release 2>&1 | grep -c ^warning` - 경고 0 유지
 - 앱 확인은 `cargo run --release`. 로컬 패키징·재설치(bundle.sh)는 CI·비상용
 - 의존성을 바꾸면 고지 파일 재생성: `cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.html` (cargo-about, `--features cli` 로 설치)
@@ -22,4 +22,6 @@
 
 ## 릴리스 (승인 후에만)
 - Cargo.toml version 올림 → `git tag vX.Y.Z` → main+태그 푸시 → Release 워크플로가 universal zip 업로드. 태그 ≠ Cargo 버전이면 CI 실패
+- Release 워크플로는 `build`(읽기 권한: 테스트·번들·zip artifact) → `publish`(쓰기 권한, 체크아웃 없이 `gh release create --verify-tag`) 두 작업. 액션은 커밋 SHA 고정이라 올릴 때 `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` 로 SHA 를 다시 조회
+- 자체 업데이트는 `https://github.com/bluelang1/url-downloader/releases/download/` 주소만 설치(https 리다이렉트만 따라감). 받은 파일에는 `com.apple.quarantine` 을 달지만 업데이트 번들에는 달지 않음
 - 배포 확인: `gh api repos/bluelang1/url-downloader/releases/latest --jq .tag_name` 와 설치 앱 `--check-update`. 미인증 API 는 IP 당 60회/시간이라 리뷰 중 많이 찌르면 앱 확인이 403 - `gh api` 로 대신 확인하고 리셋(`x-ratelimit-reset`) 후 재시도

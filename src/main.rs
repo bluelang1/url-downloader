@@ -961,10 +961,16 @@ fn read_text(path: Option<&Path>) -> Option<String> {
 fn notify(title: &str, msg: &str) {
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
-        msg.replace('"', "'"),
-        title.replace('"', "'")
+        applescript_text(msg),
+        applescript_text(title)
     );
     let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+}
+
+/// AppleScript 큰따옴표 문자열 안에 넣을 문구. 역슬래시를 먼저 두 배로 하고(끝의 `\` 가 닫는 따옴표를 무력화하지 못하게),
+/// 큰따옴표는 작은따옴표로 바꾼다
+fn applescript_text(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "'")
 }
 
 fn pick_folder() -> Option<PathBuf> {
@@ -2509,7 +2515,29 @@ fn download_file(src: &Source, dest: &Path, segments: usize, stop: &AtomicU8, se
     if dest.exists() {
         return Err(EXISTS.to_string());
     }
-    std::fs::rename(&part, dest).map_err(|e| e.to_string())
+    std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+    mark_quarantine(dest);
+    Ok(())
+}
+
+/// 받은 최종 파일에 브라우저로 받은 파일처럼 격리 표시(com.apple.quarantine)를 단다. 열 때 Gatekeeper 확인이 뜬다.
+/// 파일시스템이 확장 속성을 지원하지 않는 등으로 실패해도 다운로드는 성공으로 둔다.
+/// 자체 업데이트(install_update)로 받은 번들에는 달지 않는다
+fn mark_quarantine(path: &Path) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = std::process::Command::new("/usr/bin/xattr")
+        .arg("-w")
+        .arg("com.apple.quarantine")
+        .arg(quarantine_value(now))
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// 격리 표시 값: `<플래그>;<유닉스 시각 16진수>;<받은 앱>;` (0081 = 다운로드한 파일, 아직 사용자가 확인하지 않음)
+fn quarantine_value(unix_secs: u64) -> String {
+    format!("0081;{unix_secs:08x};URL Downloader;")
 }
 
 fn sidecar(dest: &Path, ext: &str) -> PathBuf {
@@ -2785,6 +2813,40 @@ fn fetch_latest_release() -> Result<Option<(String, String)>, String> {
     Ok(Some((latest, url)))
 }
 
+/// 업데이트 zip 을 받아도 되는 주소: 이 리포 릴리스의 첨부 파일. 정규화(`..`·`%2e%2e` 등)로 경로가 바뀌는 주소는 거부한다
+fn is_release_asset_url(url: &str) -> bool {
+    let prefix = format!("https://github.com/{REPO}/releases/download/");
+    let Some(rest) = url.strip_prefix(&prefix) else { return false };
+    if rest.is_empty() {
+        return false;
+    }
+    match reqwest::Url::parse(url) {
+        Ok(u) => u.as_str() == url && u.scheme() == "https" && u.host_str() == Some("github.com") && u.port().is_none(),
+        Err(_) => false,
+    }
+}
+
+/// 업데이트 zip 을 받는 클라이언트. GitHub 은 다른 호스트(objects.githubusercontent.com 등)로 보내므로
+/// 리다이렉트 호스트는 제한하지 않고 https 만 따라간다
+fn update_client() -> Result<Client, String> {
+    Client::builder()
+        .user_agent(format!("url-downloader/{VERSION}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if redirect_allowed(attempt.url().scheme(), attempt.previous().len()) {
+                attempt.follow()
+            } else {
+                attempt.error("업데이트 리다이렉트는 https 로만 따라갑니다")
+            }
+        }))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// 업데이트 리다이렉트를 따라가도 되는지. `previous` 는 지금까지 요청한 주소 수(처음 요청 포함)
+fn redirect_allowed(scheme: &str, previous: usize) -> bool {
+    scheme == "https" && previous < 10
+}
+
 fn parse_version(v: &str) -> (u64, u64, u64) {
     let mut it = v.split(['.', '-', '+']).map(|p| p.parse::<u64>().unwrap_or(0));
     (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
@@ -2803,6 +2865,10 @@ fn current_bundle() -> Result<PathBuf, String> {
 
 /// zip 을 받아 풀고 현재 번들을 새 번들로 바꾼다. 성공하면 새 번들 경로를 돌려준다
 fn install_update(url: &str, set: &dyn Fn(UpdateState)) -> Result<PathBuf, String> {
+    // 이 리포의 공식 릴리스 파일만 설치한다 (릴리스 API 응답·--self-update 인자 모두). 우회 경로는 없다
+    if !is_release_asset_url(url) {
+        return Err(format!("공식 릴리스 주소가 아니라 설치하지 않습니다: {url}"));
+    }
     let bundle = current_bundle()?;
     let work = std::env::temp_dir().join(format!("url-downloader-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
@@ -2810,8 +2876,7 @@ fn install_update(url: &str, set: &dyn Fn(UpdateState)) -> Result<PathBuf, Strin
     let zip = work.join("update.zip");
 
     set(UpdateState::Downloading { done: 0, total: None });
-    let client = Client::builder().user_agent(format!("url-downloader/{VERSION}")).build().map_err(|e| e.to_string())?;
-    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+    let mut resp = update_client()?.get(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -3251,6 +3316,148 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), *data);
         assert!(!dir.join("big.bin.part").exists());
         assert!(!dir.join("big.bin.meta").exists());
+        // 이어받기로 완료한 파일에도 격리 표시가 붙는다
+        let q = quarantine_of(&dir.join("big.bin")).expect("이어받아 완료한 파일에 격리 표시가 없다");
+        assert!(q.starts_with("0081;"), "격리 표시 값: {q}");
+    }
+
+    /// `xattr -p com.apple.quarantine` 결과 (없으면 None)
+    pub(super) fn quarantine_of(path: &Path) -> Option<String> {
+        let out = std::process::Command::new("/usr/bin/xattr").arg("-p").arg("com.apple.quarantine").arg(path).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    // 받은 최종 파일에는 브라우저로 받은 파일처럼 격리 표시(com.apple.quarantine)를 단다. 받는 중(.part)에는 달지 않는다
+    #[test]
+    fn finished_download_gets_quarantine_attribute() {
+        let data = big_data();
+        let (url, _) = serve(Arc::clone(&data), 0);
+        let dir = tmp("quarantine");
+        let shared = item(&url, "big.bin", &dir);
+        download(Arc::clone(&shared), 0, 4);
+        assert!(matches!(shared.lock().unwrap()[0].status, Status::Finished));
+        let q = quarantine_of(&dir.join("big.bin")).expect("완료한 파일에 격리 표시가 없다");
+        assert!(q.starts_with("0081;"), "격리 표시 값: {q}");
+        assert!(q.ends_with(";URL Downloader;"), "격리 표시 값: {q}");
+
+        // Range 를 무시하는 서버(한 줄기로 받기)도 같다
+        let url = serve_no_range_pub(Arc::clone(&data), 0);
+        let dir = tmp("quarantine_whole");
+        let shared = item(&url, "big.bin", &dir);
+        download(Arc::clone(&shared), 0, 4);
+        assert!(matches!(shared.lock().unwrap()[0].status, Status::Finished));
+        assert!(quarantine_of(&dir.join("big.bin")).is_some_and(|q| q.starts_with("0081;")));
+    }
+
+    #[test]
+    fn quarantine_value_format() {
+        assert_eq!(quarantine_value(0x5f8a_1b2c), "0081;5f8a1b2c;URL Downloader;");
+        assert_eq!(quarantine_value(0x10), "0081;00000010;URL Downloader;");
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    const GOOD: &str = "https://github.com/bluelang1/url-downloader/releases/download/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip";
+
+    #[test]
+    fn release_asset_url_accepts_only_this_repo_release_downloads() {
+        assert!(is_release_asset_url(GOOD));
+        for bad in [
+            // http
+            "http://github.com/bluelang1/url-downloader/releases/download/v0.6.0/x.zip",
+            // 다른 호스트
+            "https://evil.example/bluelang1/url-downloader/releases/download/v0.6.0/x.zip",
+            "https://github.com.evil.example/bluelang1/url-downloader/releases/download/v0.6.0/x.zip",
+            "https://objects.githubusercontent.com/bluelang1/url-downloader/releases/download/v0.6.0/x.zip",
+            "https://github.com:8443/bluelang1/url-downloader/releases/download/v0.6.0/x.zip",
+            "https://user@github.com/bluelang1/url-downloader/releases/download/v0.6.0/x.zip",
+            // 다른 리포·다른 경로
+            "https://github.com/someone/url-downloader/releases/download/v0.6.0/x.zip",
+            "https://github.com/bluelang1/url-downloader-fork/releases/download/v0.6.0/x.zip",
+            "https://github.com/bluelang1/url-downloader/archive/refs/tags/v0.6.0.zip",
+            "https://github.com/bluelang1/url-downloader/releases/download/",
+            // 정규화하면 다른 경로로 빠지는 주소
+            "https://github.com/bluelang1/url-downloader/releases/download/../../../../evil/x/releases/download/v1/x.zip",
+            "https://github.com/bluelang1/url-downloader/releases/download/%2e%2e/%2e%2e/%2e%2e/%2e%2e/evil/x.zip",
+            "",
+            "not a url",
+        ] {
+            assert!(!is_release_asset_url(bad), "거부해야 한다: {bad}");
+        }
+    }
+
+    // 검증을 통과하지 못한 주소는 내려받기 전에 사용자에게 보이는 오류로 거부한다
+    #[test]
+    fn install_update_rejects_untrusted_url_before_downloading() {
+        let (base, hits) = serve_redirect(None);
+        let started = AtomicUsize::new(0);
+        for url in [format!("{base}/update.zip"), "https://evil.example/x.zip".to_string()] {
+            let err = install_update(&url, &|_| {
+                started.fetch_add(1, SeqCst);
+            })
+            .unwrap_err();
+            assert!(err.contains("공식 릴리스"), "오류 문구: {err}");
+        }
+        assert_eq!(started.load(SeqCst), 0, "내려받기를 시작하면 안 된다");
+        assert_eq!(hits.load(SeqCst), 0, "요청을 보내면 안 된다");
+    }
+
+    #[test]
+    fn update_redirects_follow_only_https() {
+        assert!(redirect_allowed("https", 0));
+        assert!(redirect_allowed("https", 9));
+        assert!(!redirect_allowed("https", 10), "리다이렉트 횟수 상한");
+        assert!(!redirect_allowed("http", 0));
+        assert!(!redirect_allowed("file", 0));
+
+        // 실제 클라이언트: http 로 리다이렉트하면 따라가지 않고 오류
+        let (target, target_hits) = serve_redirect(None);
+        let (base, _) = serve_redirect(Some(format!("{target}/next.zip")));
+        let res = update_client().unwrap().get(format!("{base}/start.zip")).send();
+        assert!(res.is_err(), "http 리다이렉트를 따라가면 안 된다");
+        assert_eq!(target_hits.load(SeqCst), 0);
+    }
+
+    /// 요청을 세고, `location` 이 있으면 302 로 보내고 없으면 404 를 준다
+    fn serve_redirect(location: Option<String>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                h.fetch_add(1, SeqCst);
+                let mut reader = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    line.clear();
+                }
+                let resp = match &location {
+                    Some(l) => format!("HTTP/1.1 302 Found\r\nLocation: {l}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    // 알림 문구는 AppleScript 문자열 안에 들어간다: 역슬래시를 먼저 두 배로, 큰따옴표는 작은따옴표로
+    #[test]
+    fn applescript_text_escapes_backslash_and_quote() {
+        assert_eq!(applescript_text("plain"), "plain");
+        assert_eq!(applescript_text(r"C:\dir\file"), r"C:\\dir\\file");
+        assert_eq!(applescript_text(r#"say "hi""#), "say 'hi'");
+        // 끝의 역슬래시가 닫는 따옴표를 무력화하지 못한다
+        assert_eq!(applescript_text(r"abc\"), r"abc\\");
+        assert_eq!(applescript_text(r#"\" & (do shell script "x") & ""#), r#"\\' & (do shell script 'x') & '"#);
     }
 }
 
@@ -4501,6 +4708,9 @@ mod mfa_tests {
         assert!(matches!(st, Status::Finished), "완료여야 한다: {}", match st { Status::Failed(e) => e, _ => String::new() });
         assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), *data);
         assert_eq!(calls.load(SeqCst), 2, "구간이 셋이어도 재발급은 한 번");
+        // S3 항목도 완료한 파일에 격리 표시가 붙는다
+        let q = tests::quarantine_of(&dir.join("big.bin")).expect("S3 로 받은 파일에 격리 표시가 없다");
+        assert!(q.starts_with("0081;"), "격리 표시 값: {q}");
 
         // 확인 요청부터 403 (이미 만료된 주소로 시작)
         let (base, _) = serve_signed(Arc::clone(&data), |sig, _| if sig == "sig0" { Act::Forbidden } else { Act::Ok });

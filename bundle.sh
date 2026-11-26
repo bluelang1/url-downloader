@@ -18,7 +18,7 @@ if [ "${UNIVERSAL:-0}" = "1" ]; then
     echo "설치: rustup target add$MISSING" >&2
     exit 1
   fi
-  cargo build --release --target aarch64-apple-darwin --target x86_64-apple-darwin
+  cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
   mkdir -p target/universal
   lipo -create -output target/universal/url_downloader \
     target/aarch64-apple-darwin/release/url_downloader \
@@ -26,7 +26,7 @@ if [ "${UNIVERSAL:-0}" = "1" ]; then
   BIN=target/universal/url_downloader
   ARCH=universal
 else
-  cargo build --release
+  cargo build --release --locked
   BIN=target/release/url_downloader
   ARCH=$(uname -m)
 fi
@@ -41,7 +41,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>$NAME</string>
   <key>CFBundleDisplayName</key><string>$NAME</string>
-  <key>CFBundleIdentifier</key><string>kr.heesung.url-downloader</string>
+  <key>CFBundleIdentifier</key><string>io.github.bluelang1.url-downloader</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleExecutable</key><string>url_downloader</string>
