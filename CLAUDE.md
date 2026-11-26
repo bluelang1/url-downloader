@@ -1,7 +1,7 @@
 # URL Downloader (Rust/egui, macOS)
 
 ## 검증
-- `cargo test --locked` - 90개(+릴리스 전용 무시 1개), ~5초. 로컬 Range 서버로 분할·이어받기까지 검증
+- `cargo test --locked` - 95개(+릴리스 전용 무시 2개), ~5초. 로컬 Range 서버로 분할·이어받기까지 검증
 - `cargo build --release 2>&1 | grep -c ^warning` - 경고 0 유지
 - 앱 확인은 `cargo run --release`. 로컬 패키징·재설치(bundle.sh)는 CI 검증·release.sh·비상용
 - 의존성을 바꾸면 고지 파일 재생성: `cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.html` (cargo-about, `--features cli` 로 설치)
@@ -22,10 +22,11 @@
 
 ## 릴리스 (승인 후에만)
 - Cargo.toml version 올림 → `git tag vX.Y.Z` → main+태그 푸시 → Release 워크플로(검증 전용) 성공 확인 → `scripts/release.sh vX.Y.Z` (로컬 빌드·서명·릴리스 생성, 비밀번호는 사람이 입력). 태그는 vX.Y.Z 만(사전 릴리스 태그 금지)
-- Release 워크플로는 `build` 한 작업, 읽기 권한만: 태그·Cargo 버전 일치 → `cargo test --locked release_keys_are_configured -- --ignored`(UPDATE_PUBLIC_KEYS 서로 다른 키 2개 이상) → `cargo test --locked` → `UNIVERSAL=1 INSTALL=0 ./bundle.sh`. 게시·artifact 없음. 액션은 커밋 SHA 고정이라 올릴 때 `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` 로 SHA 를 다시 조회
-- `scripts/release.sh` 는 CI 산출물을 받지 않는다: 로컬·원격 태그 커밋 일치 + 그 커밋의 Release 실행 성공 확인 → 태그를 임시 워크트리로 꺼내 빌드 → 서명 공개키가 태그의 UPDATE_PUBLIC_KEYS 에 있는지 확인 → minisign 서명·검증 → 초안 릴리스에 zip·.minisig 업로드 확인 후 공개. 릴리스가 이미 있으면(초안 포함) 멈춤. 키 위치 `URL_DOWNLOADER_SIGN_KEY`/`_PUB`(기본 `$HOME/.config/url-downloader/release-main.key`/`.pub`)
-- 앱은 zip + 같은 이름 `.minisig` 자산이 둘 다 있는 릴리스만 업데이트로 제안. 설치는 서명 파일 먼저(크기·형식) → zip(멈춤 타임아웃 30초, 전체 제한 없음) → 검증 → 압축 풀기. 작업 폴더는 임의 이름 0700 새 폴더
+- Release 워크플로는 `build` 한 작업, 읽기 권한만: 태그·Cargo 버전 일치 → `cargo test --locked -- --ignored --exact security_tests::release_keys_are_configured`(UPDATE_PUBLIC_KEYS 서로 다른 키 2개 이상, 출력에 `1 passed` 확인) → `cargo test --locked` → `UNIVERSAL=1 INSTALL=0 ./bundle.sh`. 게시·artifact 없음. 액션은 커밋 SHA 고정이라 올릴 때 `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` 로 SHA 를 다시 조회
+- `scripts/release.sh` 는 CI 산출물을 받지 않고 터미널에서만 돈다(표준입력이 터미널이 아니면 중단, 건너뛰는 옵션 없음). 순서: 키 확인(키 파일 → 로컬·원격 태그 커밋 일치 → 그 커밋의 Release 실행 성공 → 릴리스 목록에 같은 태그 없음(초안이면 "지운 뒤 다시 실행") → 태그를 임시 워크트리로 꺼내 공개키가 UPDATE_PUBLIC_KEYS 에 있는지 grep, `//` 줄 제외) → 커밋 확인(직전 태그부터의 `git log`·`git diff --stat` 을 보여 주고 태그 이름을 그대로 입력받음) → 빌드(`release_keys_are_configured` + bundle.sh) → 서명(minisign -S, -V) → 앱 코드로 검증(`URL_DOWNLOADER_VERIFY_ZIP=<zip> cargo test --locked -- --ignored --exact security_tests::release_artifact_verifies`, `1 passed` 확인) → 초안(zip·.minisig 업로드 확인) → 공개. 키 위치 `URL_DOWNLOADER_SIGN_KEY`/`_PUB`(기본 `$HOME/.config/url-downloader/release-main.key`/`.pub`)
+- `gh release view <tag>` 도 초안을 찾지만(gh 의 fetchDraftRelease) 최근 것만 보므로, 스크립트는 `gh api repos/<repo>/releases --paginate` 에서 `tag_name` 으로 찾는다
+- 앱은 이름이 정확히 `URL-Downloader-<tag>-macos-universal.zip` 인 자산 + 그 `.minisig` 가 둘 다 있는 릴리스만 설치 가능한 업데이트로 제안. 새 버전인데 짝이 없으면 "서명 확인 전" 안내만(설치 버튼 없음, `--check-update` 종료코드 2. 0 은 최신·설치 가능, 1 은 확인 실패). 설치는 서명 파일 먼저(크기·형식) → zip(멈춤 타임아웃 30초, 전체 시간 제한 없음, 크기 상한 200MB: API `size`·Content-Length·받은 양) → 검증 → 압축 풀기. 작업 폴더는 임의 이름 0700 새 폴더
 - 자체 업데이트는 `https://github.com/bluelang1/url-downloader/releases/download/` 주소만 설치(https 리다이렉트만 따라감). 받은 파일에는 `com.apple.quarantine` 을 달지만 업데이트 번들에는 달지 않음
 - 업데이트 설치 조건: `UPDATE_PUBLIC_KEYS`(src/main.rs, 비면 전부 거부. 실제 키는 리포 주인이 넣는다) 중 하나로 `.minisig` 검증 + trusted comment `file:<zip 파일명>` + 태그·주소·파일명 버전 일치 + 현재보다 높은 버전
-- 남는 위험: 서명 키 유출 시 무력, 정식 서명된 예전 버전 중 현재보다 높은 버전으로의 고정은 못 막음
+- 남는 위험: 서명 키 유출 시 무력, 정식 서명된 예전 버전 중 현재보다 높은 버전으로의 고정은 못 막음, 0.5.0 이하 설치본은 서명을 확인하지 않음(서명 검증이 들어간 첫 버전으로 올라온 뒤부터 보호), 서명되는 것은 로컬 태그의 커밋이라 원격에서 받아 온 악성 커밋도 함께 서명됨(그래서 커밋 확인 단계)
 - 배포 확인: `gh api repos/bluelang1/url-downloader/releases/latest --jq .tag_name` 와 설치 앱 `--check-update`. 미인증 API 는 IP 당 60회/시간이라 리뷰 중 많이 찌르면 앱 확인이 403 - `gh api` 로 대신 확인하고 리셋(`x-ratelimit-reset`) 후 재시도

@@ -21,6 +21,8 @@ const REPO: &str = "bluelang1/url-downloader";
 const UPDATE_PUBLIC_KEYS: &[&str] = &[];
 /// 업데이트 서명 파일(`<zip>.minisig`) 크기 상한
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
+/// 업데이트 zip 크기 상한 (릴리스 API 의 자산 크기, 응답 Content-Length, 실제로 받은 양 모두에 적용)
+const MAX_UPDATE_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 /// 업데이트 요청의 연결 타임아웃
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 릴리스 API·서명 파일 요청의 전체 타임아웃 (작은 응답)
@@ -316,6 +318,8 @@ enum UpdateState {
     Checking,
     UpToDate,
     Available { version: String, url: String },
+    /// 새 버전이 올라왔지만 설치할 zip·서명 짝이 아직 없음. 설치 버튼 없이 알리기만 한다
+    Unsigned { version: String },
     Downloading { done: u64, total: Option<u64> },
     Installing,
     Error(String),
@@ -372,13 +376,14 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("--check-update") => {
-            match fetch_latest_release() {
-                Ok(Some((v, url))) => println!("available: v{v} {url}"),
-                Ok(None) => println!("up to date ({VERSION})"),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
+            let (code, line) = check_update_report(&fetch_latest_release());
+            if code == 1 {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+            if code != 0 {
+                std::process::exit(code);
             }
             return Ok(());
         }
@@ -1180,6 +1185,7 @@ const HELP: &[Section] = &[
                 "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 제목 'URL Downloader (v현재버전)' 옆에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다.",
                 "버튼을 누르면 새 버전을 받아 지금 실행 중인 .app 을 같은 자리에서 교체하고 자동으로 다시 시작합니다. 진행 중인 다운로드는 끊기므로 끝난 뒤에 누르세요.",
                 "받은 업데이트 파일은 개발자 서명(minisign)을 확인한 뒤에만 설치합니다. 서명이 없거나 맞지 않으면 설치하지 않고 받은 파일을 지웁니다.",
+                "새 버전이 올라왔지만 서명 파일이 아직 없으면 버튼 대신 'vX.Y.Z 서명 확인 전 · 릴리스 페이지' 만 보입니다. 서명이 올라오면 다음 확인 때 버튼이 나타납니다.",
                 "[정보 → URL Downloader 정보] 화면에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있고, 켜 둔 채로 두면 1시간마다 자동으로 다시 확인합니다.",
                 "cargo run 처럼 .app 번들이 아닌 상태로 실행 중이면 업데이트 버튼은 동작하지 않습니다.",
                 "교체에 실패하면 기존 앱을 그대로 되돌리고 상단에 ⚠ 표시가 뜹니다. 마우스를 올리면 사유가 보입니다.",
@@ -1472,6 +1478,10 @@ impl App {
                 }
                 UpdateState::Available { version, .. } => {
                     ui.label(egui::RichText::new(format!("새 버전 v{version} 이 있습니다. 다운로드 화면 제목 옆 버튼으로 업데이트하세요.")).color(tone(ui, Tone::Info)));
+                }
+                UpdateState::Unsigned { version } => {
+                    ui.label(egui::RichText::new(format!("v{version} 이 올라왔지만 서명 확인 전입니다")).color(tone(ui, Tone::Info)));
+                    ui.hyperlink_to("릴리스 페이지", format!("{REPO_URL}/releases"));
                 }
                 UpdateState::Error(e) => {
                     ui.label(egui::RichText::new(format!("업데이트 확인 실패: {e}")).color(tone(ui, Tone::Muted)).small());
@@ -2227,6 +2237,11 @@ impl App {
                     self.apply_update(version, url);
                 }
             }
+            UpdateState::Unsigned { version } => {
+                ui.label(egui::RichText::new(format!("v{version} 서명 확인 전")).color(tone(ui, Tone::Muted)))
+                    .on_hover_text(format!("v{version} 이 올라왔지만 서명 확인 전이라 자동으로 설치하지 않습니다"));
+                ui.hyperlink_to("릴리스 페이지", format!("{REPO_URL}/releases"));
+            }
             UpdateState::Downloading { done, total } => {
                 let text = match total {
                     Some(t) if t > 0 => format!("업데이트 받는 중 {} / {}", fmt_bytes(done), fmt_bytes(t)),
@@ -2247,14 +2262,17 @@ impl App {
         }
     }
 
-    /// GitHub 최신 릴리스를 조회해 현재 버전보다 새 것이면 Available 로 바꾼다.
-    /// 이미 Available 이면 확인하는 동안에도 버튼을 유지하고, 확인이 실패해도 그대로 둔다.
+    /// GitHub 최신 릴리스를 조회해 현재 버전보다 새 것이면 Available(서명 전이면 Unsigned)로 바꾼다.
+    /// 이미 Available·Unsigned 이면 확인하는 동안에도 표시를 유지하고, 확인이 실패해도 그대로 둔다.
     fn check_update(&self) {
         let state = Arc::clone(&self.update);
         {
             let mut s = state.lock().unwrap();
             match *s {
-                UpdateState::Available { .. } | UpdateState::Downloading { .. } | UpdateState::Installing => {}
+                UpdateState::Available { .. }
+                | UpdateState::Unsigned { .. }
+                | UpdateState::Downloading { .. }
+                | UpdateState::Installing => {}
                 _ => *s = UpdateState::Checking,
             }
         }
@@ -2287,19 +2305,21 @@ impl App {
 
 /// 업데이트 확인 결과를 반영한 새 상태. 바꿀 필요가 없으면 None
 /// - 설치가 진행 중이면 건드리지 않는다
-/// - 이미 Available 인데 확인이 실패하면 기존 버튼을 유지한다
-fn next_update_state(prev: &UpdateState, result: Result<Option<(String, String)>, String>) -> Option<UpdateState> {
+/// - 이미 Available·Unsigned 인데 확인이 실패하면 기존 표시를 유지한다
+fn next_update_state(prev: &UpdateState, result: Result<LatestRelease, String>) -> Option<UpdateState> {
     if matches!(prev, UpdateState::Downloading { .. } | UpdateState::Installing) {
         return None;
     }
     let next = match result {
-        Ok(Some((version, url))) => UpdateState::Available { version, url },
-        Ok(None) => UpdateState::UpToDate,
-        Err(_) if matches!(prev, UpdateState::Available { .. }) => return None,
+        Ok(LatestRelease::Available { version, url }) => UpdateState::Available { version, url },
+        Ok(LatestRelease::Unsigned { version }) => UpdateState::Unsigned { version },
+        Ok(LatestRelease::UpToDate) => UpdateState::UpToDate,
+        Err(_) if matches!(prev, UpdateState::Available { .. } | UpdateState::Unsigned { .. }) => return None,
         Err(e) => UpdateState::Error(e),
     };
     let same = match (prev, &next) {
         (UpdateState::Available { version: a, url: u }, UpdateState::Available { version: b, url: v }) => a == b && u == v,
+        (UpdateState::Unsigned { version: a }, UpdateState::Unsigned { version: b }) => a == b,
         (UpdateState::UpToDate, UpdateState::UpToDate) => true,
         _ => false,
     };
@@ -2793,8 +2813,35 @@ fn load_meta(path: &Path, url: &str) -> Option<Meta> {
     }
 }
 
-/// (새 버전, zip 다운로드 URL). 현재 버전 이하이거나 서명된 zip 이 없으면 None
-fn fetch_latest_release() -> Result<Option<(String, String)>, String> {
+/// 최신 릴리스 확인 결과
+#[derive(Debug, PartialEq)]
+enum LatestRelease {
+    /// 현재 버전이 최신 (릴리스가 아직 없을 때 포함)
+    UpToDate,
+    /// 설치할 수 있는 새 버전: 정해진 이름의 zip(`release_zip_name`)과 그 `.minisig` 가 함께 있음
+    Available { version: String, url: String },
+    /// 새 버전은 올라왔지만 zip·서명 짝이 아직 없음 (서명 전 등). 설치 버튼 없이 알리기만 한다
+    Unsigned { version: String },
+}
+
+/// 릴리스에서 설치 대상으로 보는 zip 이름 (bundle.sh 의 universal zip 이름 규칙). `tag` 는 `v<버전>`
+fn release_zip_name(tag: &str) -> String {
+    format!("URL-Downloader-{tag}-macos-universal.zip")
+}
+
+/// `--check-update` 출력 한 줄과 종료 코드.
+/// 0: 최신 또는 설치 가능한 새 버전, 2: 새 버전은 있으나 서명 전(설치 불가), 1: 확인 실패(표준 오류로 출력)
+fn check_update_report(result: &Result<LatestRelease, String>) -> (i32, String) {
+    match result {
+        Ok(LatestRelease::Available { version, url }) => (0, format!("available: v{version} {url}")),
+        Ok(LatestRelease::UpToDate) => (0, format!("up to date ({VERSION})")),
+        Ok(LatestRelease::Unsigned { version }) => (2, format!("v{version} available but not signed yet ({REPO_URL}/releases)")),
+        Err(e) => (1, format!("error: {e}")),
+    }
+}
+
+/// GitHub 최신 릴리스를 조회해 현재 버전과 비교한다
+fn fetch_latest_release() -> Result<LatestRelease, String> {
     let resp = update_client()?
         .get(
             std::env::var("URL_DOWNLOADER_UPDATE_API")
@@ -2805,34 +2852,42 @@ fn fetch_latest_release() -> Result<Option<(String, String)>, String> {
         .send()
         .map_err(|e| e.to_string())?;
     if resp.status() == StatusCode::NOT_FOUND {
-        return Ok(None); // 아직 릴리스가 없음
+        return Ok(LatestRelease::UpToDate); // 아직 릴리스가 없음
     }
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
     let body = resp.text().map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    Ok(latest_release_from_json(&json, VERSION))
+    latest_release_from_json(&json, VERSION)
 }
 
-/// 릴리스 API 응답에서 (새 버전, zip 주소). zip 과 같은 이름 + `.minisig` 자산이 함께 있을 때만 새 버전으로 본다.
-/// 서명 전 릴리스(zip 만 있음)는 업데이트로 제안하지 않는다 (설치해도 서명 확인에서 실패하므로 최신 상태와 같은 취급)
-fn latest_release_from_json(json: &serde_json::Value, current: &str) -> Option<(String, String)> {
-    let latest = json["tag_name"].as_str().unwrap_or("").trim_start_matches('v');
+/// 릴리스 API 응답을 분류한다.
+/// - 현재 버전 이하 → UpToDate
+/// - 이름이 정확히 `release_zip_name(태그)` 인 zip 과 그 `.minisig` 가 둘 다 있음 → Available (자산 순서와 무관,
+///   다른 zip 은 서명이 있어도 고르지 않는다). zip 의 `size` 가 MAX_UPDATE_ZIP_BYTES 를 넘으면 받기 전에 오류
+/// - 그 밖의 새 버전(서명 전, zip 없음) → Unsigned
+fn latest_release_from_json(json: &serde_json::Value, current: &str) -> Result<LatestRelease, String> {
+    let tag = json["tag_name"].as_str().unwrap_or("");
+    let latest = tag.trim_start_matches('v');
     if parse_version(latest) <= parse_version(current) {
-        return None;
+        return Ok(LatestRelease::UpToDate);
     }
-    let assets: Vec<(&str, &str)> = json["assets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|a| Some((a["name"].as_str()?, a["browser_download_url"].as_str()?)))
-        .collect();
-    assets
-        .iter()
-        .filter(|(name, _)| name.ends_with(".zip"))
-        .find(|(name, _)| assets.iter().any(|(sig, _)| sig.strip_suffix(".minisig") == Some(*name)))
-        .map(|(_, url)| (latest.to_string(), url.to_string()))
+    let unsigned = || Ok(LatestRelease::Unsigned { version: latest.to_string() });
+    let zip_name = release_zip_name(tag);
+    let sig_name = format!("{zip_name}.minisig");
+    let assets: Vec<&serde_json::Value> = json["assets"].as_array().into_iter().flatten().collect();
+    let find = |name: &str| assets.iter().copied().find(|a| a["name"].as_str() == Some(name));
+    let (Some(zip), Some(_)) = (find(&zip_name), find(&sig_name)) else { return unsigned() };
+    let Some(url) = zip["browser_download_url"].as_str() else { return unsigned() };
+    if let Some(size) = zip["size"].as_u64().filter(|&n| n > MAX_UPDATE_ZIP_BYTES) {
+        return Err(format!(
+            "업데이트 파일({})이 크기 상한({})을 넘어 받지 않습니다. {MANUAL_UPDATE_HINT}",
+            fmt_bytes(size),
+            fmt_bytes(MAX_UPDATE_ZIP_BYTES)
+        ));
+    }
+    Ok(LatestRelease::Available { version: latest.to_string(), url: url.to_string() })
 }
 
 /// 업데이트 zip 을 받아도 되는 주소: 이 리포 릴리스의 첨부 파일. 정규화(`..`·`%2e%2e` 등)로 경로가 바뀌는 주소는 거부한다
@@ -3039,7 +3094,7 @@ fn install_update_with_keys(
     // 다른 사용자·프로세스가 미리 만들어 둘 수 없는 새 폴더(임의 이름, 0700)에서만 작업한다
     let work = new_update_work_dir()?;
     // 성공·실패 모두 받은 zip·서명·압축 푼 것을 지운다
-    let result = download_verify_replace(url, &sig_url, file_name, keys, &bundle, &work, set);
+    let result = download_verify_replace(url, &sig_url, file_name, keys, &bundle, &work, MAX_UPDATE_ZIP_BYTES, set);
     let _ = std::fs::remove_dir_all(&work);
     result
 }
@@ -3089,6 +3144,8 @@ fn random_suffix() -> String {
 
 /// 서명 파일 → zip → 검증 → 압축 풀기 → 번들 교체. 주소·버전·키 검사는 호출하는 `install_update_with_keys` 가 먼저 한다
 /// (이 함수는 받은 주소를 그대로 요청하므로 공개 진입점에서 직접 부르지 않는다. 테스트는 로컬 서버 주소로 부른다)
+/// `max_zip`: zip 크기 상한 (배포 경로는 MAX_UPDATE_ZIP_BYTES)
+#[allow(clippy::too_many_arguments)]
 fn download_verify_replace(
     url: &str,
     sig_url: &str,
@@ -3096,6 +3153,7 @@ fn download_verify_replace(
     keys: &[&str],
     bundle: &Path,
     work: &Path,
+    max_zip: u64,
     set: &dyn Fn(UpdateState),
 ) -> Result<PathBuf, String> {
     let zip = work.join("update.zip");
@@ -3108,25 +3166,13 @@ fn download_verify_replace(
     let sig = fetch_update_signature(&client, sig_url, UPDATE_REQUEST_TIMEOUT).map_err(sig_fail)?;
     decode_update_signature(&sig).map_err(sig_fail)?;
 
-    // zip 은 전체 시간 제한 없이, 멈춤 타임아웃(UPDATE_STALL_TIMEOUT)만으로 받는다
-    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+    // zip 은 전체 시간 제한 없이, 멈춤 타임아웃(UPDATE_STALL_TIMEOUT)만으로 받는다. 크기는 max_zip 까지만
+    let resp = client.get(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
     let total = resp.content_length();
-    let mut file = File::create(&zip).map_err(|e| e.to_string())?;
-    let mut buf = [0u8; BUF];
-    let mut done = 0u64;
-    loop {
-        let n = resp.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        done += n as u64;
-        set(UpdateState::Downloading { done, total });
-    }
-    drop(file);
+    save_update_zip(resp, total, &zip, max_zip, set)?;
 
     // 검증 전에는 zip 을 풀거나 실행하지 않는다
     verify_update_signature(keys, &sig, file_name, || File::open(&zip)).map_err(sig_fail)?;
@@ -3151,6 +3197,35 @@ fn download_verify_replace(
     }
     let _ = std::fs::remove_dir_all(&backup);
     Ok(bundle.to_path_buf())
+}
+
+/// 업데이트 zip 응답을 `dest` 에 쓴다. 응답 크기(`total`)나 실제로 받은 양이 `max` 를 넘으면 멈추고 받던 파일을 지운다
+fn save_update_zip(mut resp: impl Read, total: Option<u64>, dest: &Path, max: u64, set: &dyn Fn(UpdateState)) -> Result<(), String> {
+    let too_big = || format!("업데이트 파일이 크기 상한({})을 넘어 받지 않습니다. {MANUAL_UPDATE_HINT}", fmt_bytes(max));
+    if total.is_some_and(|n| n > max) {
+        return Err(too_big());
+    }
+    let result = (|| {
+        let mut file = File::create(dest).map_err(|e| e.to_string())?;
+        let mut buf = [0u8; BUF];
+        let mut done = 0u64;
+        loop {
+            let n = resp.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Ok(());
+            }
+            done += n as u64;
+            if done > max {
+                return Err(too_big());
+            }
+            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            set(UpdateState::Downloading { done, total });
+        }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -3849,10 +3924,10 @@ wok80NKOs9bx2ACBaXBDj6RApPAnO88LAdqCEPNMY6TGvjUflvzU14IqV2io9nsgNA402XAm+LAzeNX2
         assert_eq!(started.load(SeqCst), 0, "내려받기를 시작하면 안 된다");
     }
 
-    // 릴리스 전용 검사 (Release 워크플로·scripts/release.sh 가 `-- --ignored` 로 실행). 평소 테스트에서는 건너뛴다.
+    // 릴리스 전용 검사 (Release 워크플로·scripts/release.sh 가 `-- --ignored --exact` 로 실행). 평소 테스트에서는 건너뛴다.
     // 키가 비어 있거나 하나뿐이면 릴리스하지 않는다: 주 키를 잃어도 예비 키로 다음 업데이트를 낼 수 있어야 한다
     #[test]
-    #[ignore = "릴리스 전용: cargo test --locked release_keys_are_configured -- --ignored"]
+    #[ignore = "릴리스 전용: cargo test --locked -- --ignored --exact security_tests::release_keys_are_configured"]
     fn release_keys_are_configured() {
         use minisign_verify::PublicKey;
         assert!(
@@ -3871,26 +3946,36 @@ wok80NKOs9bx2ACBaXBDj6RApPAnO88LAdqCEPNMY6TGvjUflvzU14IqV2io9nsgNA402XAm+LAzeNX2
         }
     }
 
-    // ---- 릴리스 API: 서명 파일이 함께 있는 릴리스만 업데이트로 제안 ----
-    fn release_json(tag: &str, assets: &[&str]) -> serde_json::Value {
+    // ---- 릴리스 API: 정해진 이름의 zip + 서명 파일이 함께 있는 릴리스만 설치 가능한 업데이트로 제안 ----
+    fn release_json_sized(tag: &str, assets: &[(&str, u64)]) -> serde_json::Value {
         let assets: Vec<serde_json::Value> = assets
             .iter()
-            .map(|n| serde_json::json!({ "name": n, "browser_download_url": format!("{V}/{tag}/{n}") }))
+            .map(|(n, size)| serde_json::json!({ "name": n, "size": size, "browser_download_url": format!("{V}/{tag}/{n}") }))
             .collect();
         serde_json::json!({ "tag_name": tag, "assets": assets })
     }
 
+    fn release_json(tag: &str, assets: &[&str]) -> serde_json::Value {
+        let sized: Vec<(&str, u64)> = assets.iter().map(|n| (*n, 1000)).collect();
+        release_json_sized(tag, &sized)
+    }
+
+    fn available(version: &str, url: String) -> Result<LatestRelease, String> {
+        Ok(LatestRelease::Available { version: version.to_string(), url })
+    }
+
+    fn unsigned(version: &str) -> Result<LatestRelease, String> {
+        Ok(LatestRelease::Unsigned { version: version.to_string() })
+    }
+
     #[test]
-    fn latest_release_requires_zip_and_matching_signature() {
+    fn latest_release_classifies_up_to_date_available_and_unsigned() {
         let zip = "URL-Downloader-v0.6.0-macos-universal.zip";
         let sig = "URL-Downloader-v0.6.0-macos-universal.zip.minisig";
-        assert_eq!(
-            latest_release_from_json(&release_json("v0.6.0", &[zip, sig]), "0.5.0"),
-            Some(("0.6.0".to_string(), format!("{V}/v0.6.0/{zip}")))
-        );
+        assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[zip, sig]), "0.5.0"), available("0.6.0", format!("{V}/v0.6.0/{zip}")));
         // 순서가 달라도 짝을 찾는다
-        assert!(latest_release_from_json(&release_json("v0.6.0", &[sig, zip]), "0.5.0").is_some());
-        // 서명이 아직 없음(서명 전 상태) / 다른 파일의 서명 / zip 없음 → 최신 상태와 같은 취급
+        assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[sig, zip]), "0.5.0"), available("0.6.0", format!("{V}/v0.6.0/{zip}")));
+        // 새 버전은 있지만 서명이 아직 없음(서명 전 상태) / 다른 파일의 서명 / zip 없음 → 설치 버튼 없이 알리기만
         for assets in [
             vec![zip],
             vec![zip, "URL-Downloader-v0.5.0-macos-universal.zip.minisig"],
@@ -3898,16 +3983,96 @@ wok80NKOs9bx2ACBaXBDj6RApPAnO88LAdqCEPNMY6TGvjUflvzU14IqV2io9nsgNA402XAm+LAzeNX2
             vec![sig],
             vec![],
         ] {
-            assert_eq!(latest_release_from_json(&release_json("v0.6.0", &assets), "0.5.0"), None, "{assets:?}");
+            assert_eq!(latest_release_from_json(&release_json("v0.6.0", &assets), "0.5.0"), unsigned("0.6.0"), "{assets:?}");
         }
-        // 서명된 zip 이 여러 개면 서명이 있는 쪽을 고른다
-        let other = "URL-Downloader-v0.6.0-macos-arm64.zip";
-        assert_eq!(
-            latest_release_from_json(&release_json("v0.6.0", &[other, zip, sig]), "0.5.0").map(|(_, u)| u),
-            Some(format!("{V}/v0.6.0/{zip}"))
+        // 현재 버전 이하이면 서명이 있든 없든 최신
+        assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[zip, sig]), "0.6.0"), Ok(LatestRelease::UpToDate));
+        assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[zip]), "0.7.0"), Ok(LatestRelease::UpToDate));
+    }
+
+    #[test]
+    fn latest_release_picks_exact_universal_zip_name_regardless_of_order() {
+        let zip = "URL-Downloader-v0.6.0-macos-universal.zip";
+        let arm = "URL-Downloader-v0.6.0-macos-arm64.zip";
+        let want = available("0.6.0", format!("{V}/v0.6.0/{zip}"));
+        // 서명된 다른 zip 이 앞에 있어도 정해진 이름의 zip 을 고른다
+        for assets in [
+            vec![arm, "URL-Downloader-v0.6.0-macos-arm64.zip.minisig", zip, "URL-Downloader-v0.6.0-macos-universal.zip.minisig"],
+            vec!["URL-Downloader-v0.6.0-macos-universal.zip.minisig", zip, "URL-Downloader-v0.6.0-macos-arm64.zip.minisig", arm],
+        ] {
+            assert_eq!(latest_release_from_json(&release_json("v0.6.0", &assets), "0.5.0"), want, "{assets:?}");
+        }
+        // 이름이 조금이라도 다르면 서명이 있어도 설치 대상이 아니다
+        for name in [
+            arm,
+            "URL-Downloader-v0.5.0-macos-universal.zip",
+            "x-URL-Downloader-v0.6.0-macos-universal.zip",
+            "URL-Downloader-v0.6.0-macos-universal.zip.zip",
+            "url-downloader-v0.6.0-macos-universal.zip",
+        ] {
+            let sig = format!("{name}.minisig");
+            assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[name, &sig]), "0.5.0"), unsigned("0.6.0"), "{name}");
+        }
+        // bundle.sh 의 universal zip 이름 규칙과 같다
+        assert_eq!(release_zip_name("v0.6.0"), zip);
+    }
+
+    #[test]
+    fn latest_release_rejects_oversized_zip_before_download() {
+        let zip = "URL-Downloader-v0.6.0-macos-universal.zip";
+        let sig = "URL-Downloader-v0.6.0-macos-universal.zip.minisig";
+        let at_limit = release_json_sized("v0.6.0", &[(zip, MAX_UPDATE_ZIP_BYTES), (sig, 300)]);
+        assert!(matches!(latest_release_from_json(&at_limit, "0.5.0"), Ok(LatestRelease::Available { .. })));
+        let over = release_json_sized("v0.6.0", &[(zip, MAX_UPDATE_ZIP_BYTES + 1), (sig, 300)]);
+        let err = latest_release_from_json(&over, "0.5.0").unwrap_err();
+        assert!(err.contains("크기"), "오류 문구: {err}");
+    }
+
+    #[test]
+    fn check_update_cli_output_and_exit_codes() {
+        let (code, line) = check_update_report(&available("9.0.0", format!("{V}/v9.0.0/URL-Downloader-v9.0.0-macos-universal.zip")));
+        assert_eq!(code, 0);
+        assert!(line.starts_with("available: v9.0.0 "), "{line}");
+        let (code, line) = check_update_report(&Ok(LatestRelease::UpToDate));
+        assert_eq!((code, line), (0, format!("up to date ({VERSION})")));
+        let (code, line) = check_update_report(&unsigned("9.0.0"));
+        assert_eq!(code, 2, "서명 전 새 버전은 업데이트 있음(0)·오류(1)와 다른 종료 코드");
+        assert!(line.starts_with("v9.0.0 available but not signed yet"), "{line}");
+        let (code, line) = check_update_report(&Err("HTTP 403".into()));
+        assert_eq!((code, line), (1, "error: HTTP 403".to_string()));
+    }
+
+    // 릴리스 전용 검사: scripts/release.sh 가 서명한 zip 을 태그 소스의 앱 코드로 검증한다 (평소 테스트에서는 건너뜀).
+    // 릴리스 API 응답에서 고르기(정해진 zip 이름·서명 짝·크기 상한) → 주소·태그·파일명 버전 → UPDATE_PUBLIC_KEYS 로 서명·trusted comment
+    #[test]
+    #[ignore = "릴리스 전용: URL_DOWNLOADER_VERIFY_ZIP=<zip> cargo test --locked -- --ignored --exact security_tests::release_artifact_verifies"]
+    fn release_artifact_verifies() {
+        let zip = PathBuf::from(
+            std::env::var("URL_DOWNLOADER_VERIFY_ZIP").expect("URL_DOWNLOADER_VERIFY_ZIP 에 검증할 zip 경로를 지정해야 합니다 (서명은 <zip>.minisig)"),
         );
-        // 현재 버전 이하이면 서명이 있어도 None
-        assert_eq!(latest_release_from_json(&release_json("v0.6.0", &[zip, sig]), "0.6.0"), None);
+        let file = zip.file_name().and_then(|n| n.to_str()).expect("zip 파일명").to_string();
+        let sig_path = PathBuf::from(format!("{}.minisig", zip.display()));
+        let sig = std::fs::read(&sig_path).unwrap_or_else(|e| panic!("서명 파일을 읽지 못했습니다 ({}): {e}", sig_path.display()));
+        let zip_size = std::fs::metadata(&zip).unwrap_or_else(|e| panic!("zip 을 읽지 못했습니다 ({}): {e}", zip.display())).len();
+        // 이 소스의 버전으로 올라간 릴리스라고 보고, 앱이 릴리스 API 응답에서 고르는 것과 같은 함수로 확인한다
+        let tag = format!("v{VERSION}");
+        let asset = |name: &str, size: u64| {
+            serde_json::json!({ "name": name, "size": size, "browser_download_url": format!("https://github.com/{REPO}/releases/download/{tag}/{name}") })
+        };
+        let json = serde_json::json!({ "tag_name": tag, "assets": [asset(&file, zip_size), asset(&format!("{file}.minisig"), sig.len() as u64)] });
+        let url = match latest_release_from_json(&json, "0.0.0") {
+            Ok(LatestRelease::Available { version, url }) => {
+                assert_eq!(version, VERSION);
+                url
+            }
+            other => panic!("앱이 이 파일을 설치할 업데이트로 고르지 않습니다 (파일명은 {} 이어야 함): {other:?}", release_zip_name(&tag)),
+        };
+        assert!(is_release_asset_url(&url), "{url}");
+        assert!(update_signature_url(&url).is_some(), "{url}");
+        let name = check_update_target(&url, Some(VERSION), "0.0.0").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(name, file);
+        verify_update_signature(UPDATE_PUBLIC_KEYS, &sig, name, || File::open(&zip))
+            .unwrap_or_else(|e| panic!("앱의 UPDATE_PUBLIC_KEYS 로 서명을 확인하지 못했습니다: {e}"));
     }
 
     // ---- 업데이트 임시 폴더 ----
@@ -3964,6 +4129,11 @@ W6qHkE+RLhdmmhbWdVNyk+7dC884pEubSvte5CWAvu/c+I0zQX3abo3Qu1NCalW7iRBHbfKR0iVuixcL
 
     /// 경로별로 정해진 상태·본문을 주는 서버. 요청한 경로를 순서대로 기록한다
     fn serve_routes(routes: Vec<(&'static str, u16, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        serve_routes_with(routes, true)
+    }
+
+    /// `send_length` 가 false 면 Content-Length 없이 본문을 보내고 연결을 닫는다 (응답 크기를 미리 알 수 없는 경우)
+    fn serve_routes_with(routes: Vec<(&'static str, u16, Vec<u8>)>, send_length: bool) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -3984,7 +4154,8 @@ W6qHkE+RLhdmmhbWdVNyk+7dC884pEubSvte5CWAvu/c+I0zQX3abo3Qu1NCalW7iRBHbfKR0iVuixcL
                     .find(|(p, _, _)| *p == path)
                     .map(|(_, st, b)| (*st, b.clone()))
                     .unwrap_or((404, Vec::new()));
-                let head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let length = if send_length { format!("Content-Length: {}\r\n", body.len()) } else { String::new() };
+                let head = format!("HTTP/1.1 {status} X\r\n{length}Connection: close\r\n\r\n");
                 let _ = s.write_all(head.as_bytes());
                 let _ = s.write_all(&body);
                 let _ = s.shutdown(Shutdown::Both);
@@ -4029,6 +4200,10 @@ W6qHkE+RLhdmmhbWdVNyk+7dC884pEubSvte5CWAvu/c+I0zQX3abo3Qu1NCalW7iRBHbfKR0iVuixcL
     }
 
     fn run_dvr(sb: &Sandbox, base: &str, file_name: &str, keys: &[&str]) -> Result<PathBuf, String> {
+        run_dvr_max(sb, base, file_name, keys, MAX_UPDATE_ZIP_BYTES)
+    }
+
+    fn run_dvr_max(sb: &Sandbox, base: &str, file_name: &str, keys: &[&str], max_zip: u64) -> Result<PathBuf, String> {
         download_verify_replace(
             &format!("{base}/update.zip"),
             &format!("{base}/update.zip.minisig"),
@@ -4036,8 +4211,34 @@ W6qHkE+RLhdmmhbWdVNyk+7dC884pEubSvte5CWAvu/c+I0zQX3abo3Qu1NCalW7iRBHbfKR0iVuixcL
             keys,
             &sb.bundle,
             &sb.work,
+            max_zip,
             &|_| {},
         )
+    }
+
+    #[test]
+    fn update_zip_over_size_limit_stops_and_cleans_up() {
+        let max = TEST_ZIP.len() as u64 - 1;
+        // 응답 크기(Content-Length)가 상한을 넘으면 본문을 받지 않는다 / 크기를 모르면 받는 도중 상한에서 멈춘다
+        for send_length in [true, false] {
+            let sb = sandbox(if send_length { "bigzip_len" } else { "bigzip_stream" });
+            let (base, _) = serve_routes_with(
+                vec![("/update.zip", 200, TEST_ZIP.to_vec()), ("/update.zip.minisig", 200, TEST_ZIP_SIG.as_bytes().to_vec())],
+                send_length,
+            );
+            let err = run_dvr_max(&sb, &base, TEST_FILE, &[TEST_KEY_ZIP], max).unwrap_err();
+            assert!(err.contains("크기 상한"), "오류 문구: {err}");
+            assert!(!sb.work.join("update.zip").exists(), "받던 zip 을 지워야 한다 (send_length={send_length})");
+            sb.assert_untouched();
+        }
+        // 상한과 같으면 설치한다 (크기를 모르는 응답도)
+        let sb = sandbox("zip_at_limit");
+        let (base, _) = serve_routes_with(
+            vec![("/update.zip", 200, TEST_ZIP.to_vec()), ("/update.zip.minisig", 200, TEST_ZIP_SIG.as_bytes().to_vec())],
+            false,
+        );
+        run_dvr_max(&sb, &base, TEST_FILE, &[TEST_KEY_ZIP], TEST_ZIP.len() as u64).unwrap();
+        assert_eq!(sb.marker(), b"TEST ONLY new bundle\n");
     }
 
     #[test]
@@ -4641,11 +4842,33 @@ mod pool_tests {
     #[test]
     fn hourly_recheck_keeps_available() {
         let avail = UpdateState::Available { version: "9.9.9".into(), url: "u".into() };
+        let found = || Ok(LatestRelease::Available { version: "9.9.9".into(), url: "u".into() });
         assert!(next_update_state(&avail, Err("offline".into())).is_none());
-        assert!(next_update_state(&avail, Ok(Some(("9.9.9".into(), "u".into())))).is_none());
-        assert!(matches!(next_update_state(&avail, Ok(None)), Some(UpdateState::UpToDate)));
+        assert!(next_update_state(&avail, found()).is_none());
+        assert!(matches!(next_update_state(&avail, Ok(LatestRelease::UpToDate)), Some(UpdateState::UpToDate)));
         assert!(matches!(next_update_state(&UpdateState::Checking, Err("x".into())), Some(UpdateState::Error(_))));
-        assert!(next_update_state(&UpdateState::Installing, Ok(None)).is_none());
+        assert!(next_update_state(&UpdateState::Installing, Ok(LatestRelease::UpToDate)).is_none());
+    }
+
+    #[test]
+    fn unsigned_release_state_has_no_install_button_and_upgrades_when_signed() {
+        let pending = || Ok(LatestRelease::Unsigned { version: "9.9.9".into() });
+        // 서명 전 새 버전 → 설치할 주소 없는 Unsigned 상태
+        assert!(matches!(
+            next_update_state(&UpdateState::Checking, pending()),
+            Some(UpdateState::Unsigned { version }) if version == "9.9.9"
+        ));
+        let unsigned = UpdateState::Unsigned { version: "9.9.9".into() };
+        assert!(next_update_state(&unsigned, pending()).is_none(), "같은 상태면 바꾸지 않는다");
+        assert!(next_update_state(&unsigned, Err("offline".into())).is_none(), "확인 실패해도 안내를 유지한다");
+        // 서명이 올라오면 설치 가능 상태로
+        assert!(matches!(
+            next_update_state(&unsigned, Ok(LatestRelease::Available { version: "9.9.9".into(), url: "u".into() })),
+            Some(UpdateState::Available { .. })
+        ));
+        // 설치 가능한 상태가 서명 전으로 바뀌는 경우(더 새 버전이 서명 전으로 올라옴)도 반영
+        let avail = UpdateState::Available { version: "9.9.8".into(), url: "u".into() };
+        assert!(matches!(next_update_state(&avail, pending()), Some(UpdateState::Unsigned { .. })));
     }
 
     #[test]

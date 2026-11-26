@@ -1,6 +1,7 @@
 #!/bin/sh
-# 릴리스를 개발자 컴퓨터에서 만든다: 태그 소스를 깨끗한 작업 폴더에서 빌드 → minisign 서명 → GitHub 릴리스 생성.
-#   scripts/release.sh vX.Y.Z
+# 릴리스를 개발자 컴퓨터에서 만든다: 키 확인 → 서명할 커밋 확인(태그 이름 입력) → 태그 소스를 깨끗한 작업 폴더에서 빌드
+# → minisign 서명 → 태그 소스의 앱 코드로 검증 → 초안 릴리스 → 공개.
+#   scripts/release.sh vX.Y.Z   (터미널에서 사람이 직접 실행. 확인을 건너뛰는 옵션은 없다)
 # 신뢰의 뿌리는 이 컴퓨터의 서명 키다. CI(Release 워크플로)는 같은 태그를 검증만 하고 아무것도 게시하지 않으며,
 # 이 스크립트는 CI 가 만든 파일을 받지 않는다 (서명할 zip 은 여기서 직접 빌드한다).
 # 비밀키 비밀번호는 minisign 이 터미널에서 직접 묻는다 (이 스크립트는 읽지 않는다).
@@ -27,6 +28,9 @@ if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
   echo "태그는 vX.Y.Z 형식이어야 합니다 (사전 릴리스 태그는 쓰지 않음): $TAG" >&2
   exit 2
 fi
+
+# 서명할 커밋을 사람이 확인해야 하므로 터미널에서만 실행한다 (자동화로 건너뛰는 옵션은 없다)
+[ -t 0 ] || die "표준입력이 터미널이 아닙니다. 릴리스는 사람이 터미널에서 직접 실행해야 합니다"
 
 for cmd in git gh minisign cargo rustup shasum ditto; do
   command -v "$cmd" >/dev/null 2>&1 || die "$cmd 명령이 필요합니다"
@@ -70,9 +74,19 @@ set -- $RUN
 [ "${3:-}" = "$LOCAL" ] || die "Release 워크플로가 검증한 커밋(${3:-?})이 태그 커밋과 다릅니다"
 echo "CI:     Release 워크플로 성공"
 
-if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-  die "릴리스 $TAG 가 이미 있습니다 (초안 포함). 확인 후 필요하면 GitHub 에서 직접 정리하세요"
-fi
+# 같은 태그의 릴리스가 이미 있으면(초안 포함) 멈춘다. 태그 조회(gh release view)는 초안을 최근 것만 찾으므로
+# 릴리스 목록 전체에서 tag_name 으로 찾는다
+check_no_release() {
+  STATE=$(gh api "repos/$REPO/releases" --paginate \
+    --jq ".[] | select(.tag_name == \"$TAG\") | if .draft then \"draft\" else \"published\" end") \
+    || die "릴리스 목록을 확인하지 못했습니다 (gh auth status 확인)"
+  case "$STATE" in
+    "") ;;
+    *draft*) die "초안이 남아 있습니다 ($TAG). GitHub 에서 지운 뒤 다시 실행하세요" ;;
+    *) die "릴리스 $TAG 가 이미 있습니다" ;;
+  esac
+}
+check_no_release
 
 # ---- d. 깨끗한 소스에서 빌드 (작업 중인 체크아웃의 수정 사항이 섞이지 않게 태그를 새 워크트리로 꺼낸다) ----
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/url-downloader-release.XXXXXX")
@@ -89,22 +103,59 @@ trap 'exit 130' INT TERM
 
 git worktree add --quiet --detach "$SRC" "$LOCAL"
 
-# ---- e. 서명할 키가 그 태그의 앱에 들어 있는지 (빌드 전에 확인) ----
-KEYS_BLOCK=$(awk '/^const UPDATE_PUBLIC_KEYS/ { p = 1 } p { print } p && /\];/ { exit }' "$SRC/src/main.rs")
+# 릴리스 전용 무시 테스트 하나를 이름 그대로(--exact) 태그 소스에서 실행하고, 실제로 1개가 통과했는지까지 확인한다
+# (필터가 틀려 0개가 실행되고 "ok" 로 끝나는 것을 막는다)
+run_release_test() {
+  OUT="$WORK/test-$1.txt"
+  echo "검사:   $1"
+  if ! (cd "$SRC" && cargo test --locked -- --ignored --exact "$1") >"$OUT" 2>&1; then
+    cat "$OUT" >&2
+    die "릴리스 검사 $1 이 실패했습니다"
+  fi
+  grep -E '^test result: ok\. 1 passed;' "$OUT" || { cat "$OUT" >&2; die "릴리스 검사 $1 이 실행되지 않았습니다 (1 passed 아님)"; }
+}
+
+# ---- e. 서명할 키가 그 태그의 앱에 들어 있는지 (빌드 전 빠른 실패용. 주석 줄은 제외. 실제 확인은 i 에서 앱 코드로) ----
+KEYS_BLOCK=$(awk '/^const UPDATE_PUBLIC_KEYS/ { p = 1 } p { print } p && /\];/ { exit }' "$SRC/src/main.rs" | grep -v '^[[:space:]]*//' || true)
 if ! printf '%s\n' "$KEYS_BLOCK" | grep -Fq -- "\"$PUBKEY\""; then
   die "앱이 모르는 키로 서명하려 합니다: $PUB 의 공개키가 $TAG 의 UPDATE_PUBLIC_KEYS 에 없습니다"
 fi
 
+# ---- f. 서명할 커밋을 사람이 확인 (빌드 전) ----
+# 서명되는 것은 이 컴퓨터의 로컬 태그가 가리키는 커밋이다. 원격에서 받아 온 커밋에 모르는 변경이 섞였는지 여기서 본다
+PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+echo
+if [ -n "$PREV" ]; then
+  echo "직전 릴리스 태그 $PREV 부터 $TAG 까지의 커밋:"
+  RANGE="$PREV..$TAG"
+  BASE=$PREV
+else
+  echo "직전 태그가 없어 $TAG 까지의 전체 커밋:"
+  RANGE=$TAG
+  BASE=$(git hash-object -t tree /dev/null)
+fi
+git --no-pager log --format='%h %an <%ae> %ad %s' --date=short "$RANGE"
+echo
+echo "변경 파일:"
+git --no-pager diff --stat "$BASE" "$TAG"
+echo
+[ -t 0 ] || die "표준입력이 터미널이 아니라 확인을 받을 수 없습니다"
+printf '이 커밋들을 서명해 배포합니다. 계속하려면 태그 이름을 입력하세요: '
+ANSWER=
+IFS= read -r ANSWER || die "입력을 받지 못했습니다"
+[ "$ANSWER" = "$TAG" ] || die "입력한 값이 태그 이름($TAG)과 달라 멈춥니다"
+
+# ---- g. 빌드 ----
+run_release_test security_tests::release_keys_are_configured
 (
   cd "$SRC"
-  cargo test --locked release_keys_are_configured -- --ignored
   UNIVERSAL=1 INSTALL=0 ./bundle.sh
 )
 NAME="URL-Downloader-$TAG-macos-universal.zip"
 ZIP="$SRC/dist/$NAME"
 [ -f "$ZIP" ] || die "빌드 결과 $NAME 이 없습니다"
 
-# ---- f. 서명 ----
+# ---- h. 서명 ----
 echo "파일:   $NAME"
 echo "크기:   $(wc -c < "$ZIP" | tr -d ' ') 바이트"
 echo "sha256: $(shasum -a 256 "$ZIP" | cut -d ' ' -f 1)"
@@ -112,19 +163,25 @@ echo "sha256: $(shasum -a 256 "$ZIP" | cut -d ' ' -f 1)"
 minisign -S -s "$KEY" -t "file:$NAME" -m "$ZIP"
 minisign -V -p "$PUB" -m "$ZIP"
 
-# ---- g. 초안으로 만들고 두 파일이 다 올라간 것을 확인한 뒤 공개 (zip 만 있고 서명이 없는 상태를 사용자가 보지 않게) ----
-if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-  die "릴리스 $TAG 가 이미 있습니다 (초안 포함)"
-fi
+# ---- i. 태그 소스의 앱 코드로 실제 검증 (UPDATE_PUBLIC_KEYS·trusted comment·파일명·태그 버전·크기 상한) ----
+export URL_DOWNLOADER_VERIFY_ZIP="$ZIP"
+run_release_test security_tests::release_artifact_verifies
+unset URL_DOWNLOADER_VERIFY_ZIP
+
+# ---- j. 초안으로 만들고 두 파일이 다 올라간 것을 확인한 뒤 공개 (zip 만 있고 서명이 없는 상태를 사용자가 보지 않게) ----
+check_no_release
 gh release create "$TAG" "$ZIP" "$ZIP.minisig" --repo "$REPO" --verify-tag --title "$TAG" --generate-notes --draft
 
 ZIP_SIZE=$(wc -c < "$ZIP" | tr -d ' ')
 SIG_SIZE=$(wc -c < "$ZIP.minisig" | tr -d ' ')
-ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[] | "\(.name) \(.size) \(.state)"')
+ASSETS=$(gh api "repos/$REPO/releases" --paginate \
+  --jq ".[] | select(.tag_name == \"$TAG\" and .draft) | .assets[] | \"\\(.name) \\(.size) \\(.state)\"") \
+  || die "초안 릴리스의 파일 목록을 확인하지 못했습니다. 초안을 확인하세요"
 printf '%s\n' "$ASSETS" | grep -Fxq "$NAME $ZIP_SIZE uploaded" \
   || die "초안 릴리스에 $NAME 이 제대로 올라가지 않았습니다. 초안을 확인하세요: $ASSETS"
 printf '%s\n' "$ASSETS" | grep -Fxq "$NAME.minisig $SIG_SIZE uploaded" \
   || die "초안 릴리스에 $NAME.minisig 가 제대로 올라가지 않았습니다. 초안을 확인하세요: $ASSETS"
 
+# ---- k. 공개 ----
 gh release edit "$TAG" --repo "$REPO" --draft=false
 echo "공개함: $TAG ($NAME, $NAME.minisig)"

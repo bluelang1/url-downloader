@@ -24,9 +24,15 @@ jobs:
         run: |
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ "v$V" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml v$V"; exit 1; }
-      # UPDATE_PUBLIC_KEYS 가 비었거나 하나뿐이거나 읽을 수 없으면 실패 (서명해도 앱이 설치하지 못하는 릴리스 방지)
+      # UPDATE_PUBLIC_KEYS 가 비었거나 하나뿐이거나 읽을 수 없으면 실패 (서명해도 앱이 설치하지 못하는 릴리스 방지).
+      # 테스트 이름을 정확히 지정하고, 실제로 1개가 통과했는지까지 확인한다 (필터가 틀려 0개 실행으로 통과하는 것 방지)
       - name: Check update signing keys are configured
-        run: cargo test --locked release_keys_are_configured -- --ignored
+        run: |
+          cargo test --locked -- --ignored --exact security_tests::release_keys_are_configured > release-keys-test.txt 2>&1 \
+            || { cat release-keys-test.txt; exit 1; }
+          cat release-keys-test.txt
+          grep -Eq '^test result: ok\. 1 passed;' release-keys-test.txt \
+            || { echo "release_keys_are_configured did not run (expected 1 passed)"; exit 1; }
       - run: cargo test --locked
       - name: Check universal bundle builds
         run: UNIVERSAL=1 INSTALL=0 ./bundle.sh
