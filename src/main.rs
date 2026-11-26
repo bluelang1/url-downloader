@@ -4793,7 +4793,7 @@ mod mfa_tests {
     #[test]
     fn s3_reissue_other_error_fails_but_keeps_partial() {
         let data = data();
-        let (base, _) = serve_signed(Arc::clone(&data), expire_mid_download);
+        let (base, hits) = serve_signed(Arc::clone(&data), expire_mid_download);
         let dir = tmp("reissue_err");
         let allow = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4807,7 +4807,6 @@ mod mfa_tests {
             Ok(format!("{b}?X-Amz-Signature=sig{n}&X-Amz-Security-Token=TOPSECRETTOKEN"))
         });
         let shared = s3_item(&dir, p);
-        let started = Instant::now();
         download(Arc::clone(&shared), 0, 4);
         {
             let items = shared.lock().unwrap();
@@ -4817,7 +4816,8 @@ mod mfa_tests {
             assert_eq!(items[0].note, None);
         }
         assert_eq!(calls.load(SeqCst), 2, "재발급 실패는 구간 재시도로 다시 부르지 않는다");
-        assert!(started.elapsed() < Duration::from_millis(3500), "재발급 실패는 구간 재시도(2초 대기)를 되풀이하지 않는다");
+        // 시간 대신 요청 수로 확인한다(느린 CI 에서 시간 기준은 흔들린다). 정상은 7회, 구간 재시도를 되풀이하면 더 늘어난다
+        assert!(hits.load(SeqCst) <= 8, "재발급 실패는 구간 재시도를 되풀이하지 않는다: 요청 {}회", hits.load(SeqCst));
         assert!(dir.join("big.bin.part").exists(), "부분 파일 보존");
         let meta = load_meta(&dir.join("big.bin.meta"), ID).expect("메타 보존");
         assert!(meta.segs.iter().any(|(_, _, d)| *d > 0));
