@@ -16,6 +16,12 @@ mod s3;
 
 const REPO: &str = "bluelang1/url-downloader";
 
+/// 자체 업데이트 zip 의 minisign 서명을 확인할 공개키 (공개키 파일 `*.pub` 의 두 번째 줄, base64 한 줄).
+/// 주 키·예비 키를 넣고, 하나라도 검증에 성공하면 통과. 비어 있으면 모든 업데이트 설치를 거부한다
+const UPDATE_PUBLIC_KEYS: &[&str] = &[];
+/// 업데이트 서명 파일(`<zip>.minisig`) 크기 상한
+const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
+
 /// 분할 구간 하나의 최소 크기. 이보다 작은 파일은 분할하지 않는다
 const MIN_CHUNK: u64 = 1024 * 1024;
 const BUF: usize = 64 * 1024;
@@ -370,7 +376,8 @@ fn main() -> eframe::Result {
         }
         Some("--self-update") => {
             let url = args.get(2).expect("--self-update <zip-url>");
-            match install_update(url, &|s| {
+            // 태그는 주소에서 읽고, 파일명 버전·현재 버전 비교·서명 확인은 앱 안 업데이트와 똑같이 거친다
+            match install_update(url, None, &|s| {
                 if let UpdateState::Installing = s {
                     eprintln!("installing…");
                 }
@@ -1164,6 +1171,7 @@ const HELP: &[Section] = &[
             Bullets(&[
                 "앱을 켤 때 GitHub 릴리스를 확인해 새 버전이 있으면 제목 'URL Downloader (v현재버전)' 옆에 [⬆ 업데이트 vX.Y.Z] 버튼이 나타납니다.",
                 "버튼을 누르면 새 버전을 받아 지금 실행 중인 .app 을 같은 자리에서 교체하고 자동으로 다시 시작합니다. 진행 중인 다운로드는 끊기므로 끝난 뒤에 누르세요.",
+                "받은 업데이트 파일은 개발자 서명(minisign)을 확인한 뒤에만 설치합니다. 서명이 없거나 맞지 않으면 설치하지 않고 받은 파일을 지웁니다.",
                 "[정보 → URL Downloader 정보] 화면에서 [업데이트 확인] 으로 언제든 다시 확인할 수 있고, 켜 둔 채로 두면 1시간마다 자동으로 다시 확인합니다.",
                 "cargo run 처럼 .app 번들이 아닌 상태로 실행 중이면 업데이트 버튼은 동작하지 않습니다.",
                 "교체에 실패하면 기존 앱을 그대로 되돌리고 상단에 ⚠ 표시가 뜹니다. 마우스를 올리면 사유가 보입니다.",
@@ -2207,8 +2215,8 @@ impl App {
                     egui::RichText::new(format!("⬆ 업데이트 v{version}")).color(egui::Color32::WHITE),
                 )
                 .fill(egui::Color32::from_rgb(40, 120, 200));
-                if ui.add(btn).on_hover_text("새 버전을 받아 설치하고 다시 시작합니다").clicked() {
-                    self.apply_update(url);
+                if ui.add(btn).on_hover_text("새 버전을 받아 서명을 확인한 뒤 설치하고 다시 시작합니다").clicked() {
+                    self.apply_update(version, url);
                 }
             }
             UpdateState::Downloading { done, total } => {
@@ -2252,11 +2260,12 @@ impl App {
     }
 
     /// 새 버전 zip 을 받아 현재 .app 번들을 교체하고 다시 시작한다
-    fn apply_update(&self, url: String) {
+    /// `version` 은 릴리스 API 의 태그(앞의 v 제외). 내려받기 주소의 태그와 같아야 설치한다
+    fn apply_update(&self, version: String, url: String) {
         let state = Arc::clone(&self.update);
         thread::spawn(move || {
             let set = |s: UpdateState| *state.lock().unwrap() = s;
-            match install_update(&url, &set) {
+            match install_update(&url, Some(&version), &set) {
                 Ok(bundle) => {
                     let _ = std::process::Command::new("open").arg("-n").arg(&bundle).spawn();
                     thread::sleep(Duration::from_millis(500));
@@ -2864,20 +2873,166 @@ fn current_bundle() -> Result<PathBuf, String> {
         .ok_or_else(|| "앱 번들(.app)로 실행 중일 때만 업데이트할 수 있습니다".to_string())
 }
 
-/// zip 을 받아 풀고 현재 번들을 새 번들로 바꾼다. 성공하면 새 번들 경로를 돌려준다
-fn install_update(url: &str, set: &dyn Fn(UpdateState)) -> Result<PathBuf, String> {
+/// 설치할 업데이트 주소 `.../releases/download/<tag>/<zip>` 를 확인하고 zip 파일명을 돌려준다.
+/// - 태그는 `v<버전>`, 파일명은 `URL-Downloader-<tag>-….zip` (bundle.sh 이름 규칙)
+/// - `expected_version`(릴리스 API 의 태그, 앞의 v 제외)이 있으면 주소의 태그와 같아야 한다
+/// - 현재 버전보다 높아야 한다 (되돌리기 방지)
+fn check_update_target<'a>(url: &'a str, expected_version: Option<&str>, current: &str) -> Result<&'a str, String> {
+    let prefix = format!("https://github.com/{REPO}/releases/download/");
+    let rest = url
+        .strip_prefix(&prefix)
+        .filter(|r| !r.contains(['?', '#']))
+        .ok_or_else(|| format!("공식 릴리스 주소가 아니라 설치하지 않습니다: {url}"))?;
+    let (tag, file) = rest
+        .split_once('/')
+        .filter(|(t, f)| !t.is_empty() && !f.is_empty() && !f.contains('/'))
+        .ok_or_else(|| format!("릴리스 파일 주소 형식이 아니라 설치하지 않습니다: {url}"))?;
+    let version = tag
+        .strip_prefix('v')
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("릴리스 태그 형식(vX.Y.Z)이 아니라 설치하지 않습니다: {tag}"))?;
+    if let Some(expected) = expected_version {
+        if expected != version {
+            return Err(format!("릴리스 태그(v{expected})와 내려받기 주소의 태그({tag})가 달라 설치하지 않습니다"));
+        }
+    }
+    if !(file.starts_with(&format!("URL-Downloader-{tag}-")) && file.ends_with(".zip")) {
+        return Err(format!("파일명의 버전이 릴리스 태그({tag})와 달라 설치하지 않습니다: {file}"));
+    }
+    if parse_version(version) <= parse_version(current) {
+        return Err(format!("v{version} 이 현재 버전(v{current})보다 높지 않아 설치하지 않습니다"));
+    }
+    Ok(file)
+}
+
+/// 업데이트 zip 의 서명 파일 주소 (`<zip 주소>.minisig`). 공식 릴리스 주소가 아니면 None
+fn update_signature_url(url: &str) -> Option<String> {
+    let sig = format!("{url}.minisig");
+    is_release_asset_url(&sig).then_some(sig)
+}
+
+/// `max` 바이트까지만 읽는다. 더 있으면 오류 (끝없는 응답도 max + 1 바이트에서 멈춘다)
+fn read_limited(r: impl Read, max: u64) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    r.take(max + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() as u64 > max {
+        return Err(format!("서명 파일이 크기 상한({max} 바이트)을 넘습니다"));
+    }
+    Ok(buf)
+}
+
+/// 업데이트 zip 의 minisign 서명 확인 (네트워크 없음).
+/// `keys` 중 하나라도 검증에 성공해야 하고, 서명에 포함된 trusted comment 가 정확히 `file:<file_name>` 이어야 한다.
+/// `open` 은 검증할 내용을 처음부터 읽는 reader 를 연다 (키 id 가 맞는 키에서만 호출)
+fn verify_update_signature<R: Read>(
+    keys: &[&str],
+    sig: &[u8],
+    file_name: &str,
+    open: impl Fn() -> std::io::Result<R>,
+) -> Result<(), String> {
+    use minisign_verify::{PublicKey, Signature};
+    if keys.is_empty() {
+        return Err("업데이트 서명 키가 설정되지 않아 설치하지 않습니다".to_string());
+    }
+    if sig.len() as u64 > MAX_SIGNATURE_BYTES {
+        return Err(format!("서명 파일이 크기 상한({MAX_SIGNATURE_BYTES} 바이트)을 넘습니다"));
+    }
+    let text = std::str::from_utf8(sig).map_err(|_| "서명 파일 형식이 올바르지 않습니다".to_string())?;
+    let signature = Signature::decode(text).map_err(|e| format!("서명 파일 형식이 올바르지 않습니다: {e}"))?;
+    let mut last_err = "설정된 서명 키와 맞지 않습니다".to_string();
+    let mut verified = false;
+    for key in keys {
+        let Ok(pk) = PublicKey::from_base64(key) else { continue };
+        // 키 id 가 다르면 내용을 읽지 않고 바로 실패한다. 레거시(사전 해시 없는) 서명은 받지 않는다
+        let Ok(mut verifier) = pk.verify_stream(&signature) else { continue };
+        let mut reader = open().map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; BUF];
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            verifier.update(&buf[..n]);
+        }
+        match verifier.finalize() {
+            Ok(()) => {
+                verified = true;
+                break;
+            }
+            Err(e) => last_err = format!("서명이 내용과 맞지 않습니다: {e}"),
+        }
+    }
+    if !verified {
+        return Err(last_err);
+    }
+    // trusted comment 는 전역 서명에 포함되므로 위조할 수 없다. 다른 파일(예: 예전 버전)의 서명을 재사용하지 못하게 한다
+    let expected = format!("file:{file_name}");
+    if signature.trusted_comment() != expected {
+        return Err(format!("서명된 파일명이 받은 파일과 다릅니다 ({} ≠ {expected})", signature.trusted_comment()));
+    }
+    Ok(())
+}
+
+/// 서명 파일을 받는다 (https 전용 업데이트 클라이언트, 크기 상한 MAX_SIGNATURE_BYTES)
+fn fetch_update_signature(client: &Client, sig_url: &str) -> Result<Vec<u8>, String> {
+    let resp = client.get(sig_url).send().map_err(|e| e.to_string())?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Err("릴리스에 서명 파일이 없습니다".to_string());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("서명 파일 HTTP {}", resp.status()));
+    }
+    if resp.content_length().is_some_and(|n| n > MAX_SIGNATURE_BYTES) {
+        return Err(format!("서명 파일이 크기 상한({MAX_SIGNATURE_BYTES} 바이트)을 넘습니다"));
+    }
+    read_limited(resp, MAX_SIGNATURE_BYTES)
+}
+
+/// zip 을 받아 서명을 확인한 뒤 풀고 현재 번들을 새 번들로 바꾼다. 성공하면 새 번들 경로를 돌려준다.
+/// `expected_version` 은 릴리스 API 의 태그(앞의 v 제외). `--self-update` 처럼 없으면 주소의 태그를 쓴다
+fn install_update(url: &str, expected_version: Option<&str>, set: &dyn Fn(UpdateState)) -> Result<PathBuf, String> {
+    install_update_with_keys(url, expected_version, UPDATE_PUBLIC_KEYS, set)
+}
+
+fn install_update_with_keys(
+    url: &str,
+    expected_version: Option<&str>,
+    keys: &[&str],
+    set: &dyn Fn(UpdateState),
+) -> Result<PathBuf, String> {
     // 이 리포의 공식 릴리스 파일만 설치한다 (릴리스 API 응답·--self-update 인자 모두). 우회 경로는 없다
     if !is_release_asset_url(url) {
         return Err(format!("공식 릴리스 주소가 아니라 설치하지 않습니다: {url}"));
+    }
+    let file_name = check_update_target(url, expected_version, VERSION)?;
+    let sig_url = update_signature_url(url).ok_or_else(|| format!("서명 파일 주소가 공식 릴리스 주소가 아닙니다: {url}"))?;
+    if keys.is_empty() {
+        return Err("업데이트 서명 키가 설정되지 않아 설치하지 않습니다".to_string());
     }
     let bundle = current_bundle()?;
     let work = std::env::temp_dir().join(format!("url-downloader-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    // 성공·실패 모두 받은 zip·서명·압축 푼 것을 지운다
+    let result = download_verify_replace(url, &sig_url, file_name, keys, &bundle, &work, set);
+    let _ = std::fs::remove_dir_all(&work);
+    result
+}
+
+fn download_verify_replace(
+    url: &str,
+    sig_url: &str,
+    file_name: &str,
+    keys: &[&str],
+    bundle: &Path,
+    work: &Path,
+    set: &dyn Fn(UpdateState),
+) -> Result<PathBuf, String> {
     let zip = work.join("update.zip");
+    let client = update_client()?;
 
     set(UpdateState::Downloading { done: 0, total: None });
-    let mut resp = update_client()?.get(url).send().map_err(|e| e.to_string())?;
+    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -2896,6 +3051,11 @@ fn install_update(url: &str, set: &dyn Fn(UpdateState)) -> Result<PathBuf, Strin
     }
     drop(file);
 
+    // 검증 전에는 zip 을 풀거나 실행하지 않는다
+    const SIG_FAIL: &str = "업데이트 파일의 서명을 확인할 수 없어 설치하지 않습니다";
+    let sig = fetch_update_signature(&client, sig_url).map_err(|e| format!("{SIG_FAIL}: {e}"))?;
+    verify_update_signature(keys, &sig, file_name, || File::open(&zip)).map_err(|e| format!("{SIG_FAIL}: {e}"))?;
+
     set(UpdateState::Installing);
     let extracted = work.join("extracted");
     run("ditto", &["-x", "-k", &zip.to_string_lossy(), &extracted.to_string_lossy()])?;
@@ -2909,14 +3069,13 @@ fn install_update(url: &str, set: &dyn Fn(UpdateState)) -> Result<PathBuf, Strin
     // 기존 번들을 옆으로 치우고 새 번들을 같은 자리에 복사한 뒤 치운 것을 지운다
     let backup = bundle.with_extension("app.old");
     let _ = std::fs::remove_dir_all(&backup);
-    std::fs::rename(&bundle, &backup).map_err(|e| format!("기존 앱을 옮기지 못했습니다: {e}"))?;
+    std::fs::rename(bundle, &backup).map_err(|e| format!("기존 앱을 옮기지 못했습니다: {e}"))?;
     if let Err(e) = run("ditto", &[&new_app.to_string_lossy(), &bundle.to_string_lossy()]) {
-        let _ = std::fs::rename(&backup, &bundle); // 실패하면 원복
+        let _ = std::fs::rename(&backup, bundle); // 실패하면 원복
         return Err(e);
     }
     let _ = std::fs::remove_dir_all(&backup);
-    let _ = std::fs::remove_dir_all(&work);
-    Ok(bundle)
+    Ok(bundle.to_path_buf())
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -3399,7 +3558,7 @@ mod security_tests {
         let (base, hits) = serve_redirect(None);
         let started = AtomicUsize::new(0);
         for url in [format!("{base}/update.zip"), "https://evil.example/x.zip".to_string()] {
-            let err = install_update(&url, &|_| {
+            let err = install_update(&url, None, &|_| {
                 started.fetch_add(1, SeqCst);
             })
             .unwrap_err();
@@ -3448,6 +3607,171 @@ mod security_tests {
             }
         });
         (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    // ---- 업데이트 서명 검증 ----
+    // TEST ONLY: 아래 키·서명은 테스트 전용으로 비밀번호 없이(minisign -G -W) 만든 일회용 키쌍의 결과물이다.
+    // 비밀키는 픽스처를 만든 뒤 지웠고 리포에 없다. 실제 업데이트 서명 키와 무관하다
+    const TEST_KEY_A: &str = "RWRKAj7DZaiYzIAjzewtqiWPpSiuGWXP0i7B+RZsnGCAV6kalapfVtz/";
+    const TEST_KEY_B: &str = "RWSXs1W7zMNYFjecDkGWzG3KDxvteWAXNZto93T9oS5ex3UD3/jF6lCg";
+    const TEST_FILE: &str = "URL-Downloader-v0.6.0-macos-universal.zip";
+    const TEST_DATA: &[u8] = b"TEST ONLY update payload\n";
+    // TEST ONLY: TEST_DATA 를 키 A 로 서명 (trusted comment: file:URL-Downloader-v0.6.0-macos-universal.zip)
+    const TEST_SIG_A: &str = "untrusted comment: signature from minisign secret key
+RURKAj7DZaiYzIe5A6tUxx5T++u8sqZk/E1JuYQ5AmmHnnGJMa7BIdltRmsFhYUv4rYQ+ItL3bg3mauTh1KZaJhuDCW190iLTQ8=
+trusted comment: file:URL-Downloader-v0.6.0-macos-universal.zip
+Q/K+ZpC0M0Bf3q+cw5bXoggGXWNedVwBh+SmLnt7NphJgCVzhe5oscvUTejcpL8hVZpq1HzOxbjHsA94+HW5AQ==
+";
+    // TEST ONLY: 같은 TEST_DATA 를 키 B 로 서명 (trusted comment 동일)
+    const TEST_SIG_B: &str = "untrusted comment: signature from minisign secret key
+RUSXs1W7zMNYFjwTR6Mwv4ZrZr6FREAM4OEeSMFbzTZluqNhqF2PlUQlaRgCA5zZi3diSG/G77+ZCkKY4gxbFyT6mpQhHERcZQs=
+trusted comment: file:URL-Downloader-v0.6.0-macos-universal.zip
+wok80NKOs9bx2ACBaXBDj6RApPAnO88LAdqCEPNMY6TGvjUflvzU14IqV2io9nsgNA402XAm+LAzeNX29NqnCQ==
+";
+
+    fn verify(keys: &[&str], sig: &[u8], file: &str, data: &[u8]) -> Result<(), String> {
+        verify_update_signature(keys, sig, file, || Ok(data))
+    }
+
+    #[test]
+    fn update_signature_accepts_valid_signature() {
+        assert_eq!(verify(&[TEST_KEY_A], TEST_SIG_A.as_bytes(), TEST_FILE, TEST_DATA), Ok(()));
+    }
+
+    #[test]
+    fn update_signature_rejects_tampered_content() {
+        let mut data = TEST_DATA.to_vec();
+        data[0] ^= 1;
+        assert!(verify(&[TEST_KEY_A], TEST_SIG_A.as_bytes(), TEST_FILE, &data).is_err());
+        // 끝에 한 바이트 덧붙여도 거부
+        let mut longer = TEST_DATA.to_vec();
+        longer.push(b'x');
+        assert!(verify(&[TEST_KEY_A], TEST_SIG_A.as_bytes(), TEST_FILE, &longer).is_err());
+    }
+
+    #[test]
+    fn update_signature_rejects_other_key() {
+        assert!(verify(&[TEST_KEY_B], TEST_SIG_A.as_bytes(), TEST_FILE, TEST_DATA).is_err());
+        assert!(verify(&[TEST_KEY_A], TEST_SIG_B.as_bytes(), TEST_FILE, TEST_DATA).is_err());
+    }
+
+    #[test]
+    fn update_signature_accepts_any_listed_key() {
+        assert_eq!(verify(&[TEST_KEY_A, TEST_KEY_B], TEST_SIG_B.as_bytes(), TEST_FILE, TEST_DATA), Ok(()));
+        assert_eq!(verify(&[TEST_KEY_A, TEST_KEY_B], TEST_SIG_A.as_bytes(), TEST_FILE, TEST_DATA), Ok(()));
+        // 깨진 키가 섞여 있어도 나머지 키로 확인한다
+        assert_eq!(verify(&["not-a-key", TEST_KEY_B], TEST_SIG_B.as_bytes(), TEST_FILE, TEST_DATA), Ok(()));
+        assert!(verify(&["not-a-key"], TEST_SIG_B.as_bytes(), TEST_FILE, TEST_DATA).is_err());
+    }
+
+    #[test]
+    fn update_signature_rejects_when_no_keys_configured() {
+        let err = verify(&[], TEST_SIG_A.as_bytes(), TEST_FILE, TEST_DATA).unwrap_err();
+        assert!(err.contains("서명 키"), "오류 문구: {err}");
+        // 배포 빌드의 키 목록이 비어 있으면 실제 설치 경로도 닫힌 쪽으로 실패한다
+        if UPDATE_PUBLIC_KEYS.is_empty() {
+            let err = verify(UPDATE_PUBLIC_KEYS, TEST_SIG_A.as_bytes(), TEST_FILE, TEST_DATA).unwrap_err();
+            assert!(err.contains("서명 키"), "오류 문구: {err}");
+        }
+    }
+
+    #[test]
+    fn update_signature_rejects_trusted_comment_for_other_file() {
+        // 서명은 유효하지만 다른 파일명(예: 예전 버전 zip)으로 받은 경우
+        let err = verify(&[TEST_KEY_A], TEST_SIG_A.as_bytes(), "URL-Downloader-v0.5.0-macos-universal.zip", TEST_DATA).unwrap_err();
+        assert!(err.contains("파일명"), "오류 문구: {err}");
+        // trusted comment 를 고쳐 쓰면 전역 서명이 맞지 않아 거부된다
+        let forged = TEST_SIG_A.replace("file:URL-Downloader-v0.6.0", "file:URL-Downloader-v0.7.0");
+        assert!(verify(&[TEST_KEY_A], forged.as_bytes(), "URL-Downloader-v0.7.0-macos-universal.zip", TEST_DATA).is_err());
+    }
+
+    #[test]
+    fn update_signature_rejects_broken_or_oversized_signature() {
+        for bad in ["", "garbage", "untrusted comment: x\nnot base64\n", &TEST_SIG_A[..TEST_SIG_A.len() / 2]] {
+            assert!(verify(&[TEST_KEY_A], bad.as_bytes(), TEST_FILE, TEST_DATA).is_err(), "거부해야 한다: {bad:?}");
+        }
+        // 서명 한 글자 변조
+        let flipped = TEST_SIG_A.replacen("Q/K+", "Q/K-", 1);
+        assert!(verify(&[TEST_KEY_A], flipped.as_bytes(), TEST_FILE, TEST_DATA).is_err());
+        // 유효한 서명이라도 크기 상한을 넘으면 거부
+        let mut big = TEST_SIG_A.as_bytes().to_vec();
+        big.resize(MAX_SIGNATURE_BYTES as usize + 1, b'\n');
+        let err = verify(&[TEST_KEY_A], &big, TEST_FILE, TEST_DATA).unwrap_err();
+        assert!(err.contains("크기"), "오류 문구: {err}");
+        // 내려받을 때도 상한 + 1 바이트까지만 읽고 거부
+        assert_eq!(read_limited(&[7u8; 10][..], 10).unwrap(), vec![7u8; 10]);
+        assert!(read_limited(&[7u8; 11][..], 10).is_err());
+        assert!(read_limited(std::io::repeat(0), MAX_SIGNATURE_BYTES).is_err(), "끝없는 응답도 멈춘다");
+        // 내용을 읽다 실패하면 거부
+        let err = verify_update_signature(&[TEST_KEY_A], TEST_SIG_A.as_bytes(), TEST_FILE, || {
+            Err::<&[u8], _>(std::io::Error::other("disk"))
+        });
+        assert!(err.is_err());
+    }
+
+    const V: &str = "https://github.com/bluelang1/url-downloader/releases/download";
+
+    #[test]
+    fn update_target_accepts_matching_newer_release() {
+        let url = format!("{V}/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip");
+        assert_eq!(check_update_target(&url, Some("0.6.0"), "0.5.0"), Ok(TEST_FILE));
+        assert_eq!(check_update_target(&url, None, "0.5.9"), Ok(TEST_FILE));
+        assert_eq!(update_signature_url(&url).as_deref(), Some(format!("{url}.minisig").as_str()));
+    }
+
+    #[test]
+    fn update_target_rejects_tag_url_or_file_version_mismatch() {
+        let good = format!("{V}/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip");
+        // 릴리스 API 의 태그와 주소의 태그가 다름
+        assert!(check_update_target(&good, Some("0.7.0"), "0.5.0").is_err());
+        assert!(check_update_target(&good, Some("v0.6.0"), "0.5.0").is_err());
+        for bad in [
+            // 주소의 태그와 파일명 버전이 다름
+            format!("{V}/v0.6.0/URL-Downloader-v0.5.0-macos-universal.zip"),
+            format!("{V}/v0.6.0/URL-Downloader-v0.6.01-macos-universal.zip"),
+            format!("{V}/v0.6.0/URL-Downloader-v0.6.0.zip"),
+            // 태그 형식이 아님
+            format!("{V}/0.6.0/URL-Downloader-0.6.0-macos-universal.zip"),
+            // zip 이 아님 / 경로 조각 수가 다름 / 쿼리·조각
+            format!("{V}/v0.6.0/URL-Downloader-v0.6.0-macos-universal.tar"),
+            format!("{V}/v0.6.0/x/URL-Downloader-v0.6.0-macos-universal.zip"),
+            format!("{V}/v0.6.0/"),
+            format!("{V}/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip?x=.zip"),
+            format!("{V}/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip#a.zip"),
+            "https://evil.example/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip".to_string(),
+        ] {
+            assert!(check_update_target(&bad, None, "0.5.0").is_err(), "거부해야 한다: {bad}");
+        }
+    }
+
+    #[test]
+    fn update_target_rejects_same_or_older_version() {
+        let url = format!("{V}/v0.6.0/URL-Downloader-v0.6.0-macos-universal.zip");
+        for current in ["0.6.0", "0.6.1", "0.7.0", "1.0.0"] {
+            let err = check_update_target(&url, None, current).unwrap_err();
+            assert!(err.contains("현재 버전"), "{current}: {err}");
+            assert!(check_update_target(&url, Some("0.6.0"), current).is_err());
+        }
+    }
+
+    // 서명 키가 없으면 앱 번들 확인·내려받기 전에 거부한다
+    #[test]
+    fn install_update_refuses_without_keys_before_downloading() {
+        let url = format!("{V}/v99.0.0/URL-Downloader-v99.0.0-macos-universal.zip");
+        let started = AtomicUsize::new(0);
+        let err = install_update_with_keys(&url, Some("99.0.0"), &[], &|_| {
+            started.fetch_add(1, SeqCst);
+        })
+        .unwrap_err();
+        assert!(err.contains("서명 키"), "오류 문구: {err}");
+        // 버전 확인도 내려받기 전에
+        let old = format!("{V}/v0.0.1/URL-Downloader-v0.0.1-macos-universal.zip");
+        let err = install_update_with_keys(&old, None, &[TEST_KEY_A], &|_| {
+            started.fetch_add(1, SeqCst);
+        })
+        .unwrap_err();
+        assert!(err.contains("현재 버전"), "오류 문구: {err}");
+        assert_eq!(started.load(SeqCst), 0, "내려받기를 시작하면 안 된다");
     }
 
     // 알림 문구는 AppleScript 문자열 안에 들어간다: 역슬래시를 먼저 두 배로, 큰따옴표는 작은따옴표로

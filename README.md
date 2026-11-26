@@ -93,6 +93,16 @@ git tag v0.3.0 && git push origin main v0.3.0
 
 `--self-update` 는 이 리포의 공식 릴리스 주소(`https://github.com/bluelang1/url-downloader/releases/download/...`)만 받습니다.
 
+### 업데이트 서명 검증
+
+앱은 업데이트 zip 을 받은 뒤, 압축을 풀기 전에 개발자 서명([minisign](https://jedisct1.github.io/minisign/))을 확인합니다.
+GitHub 계정이나 릴리스가 바뀌어도, 개발자가 자기 컴퓨터에만 둔 키로 서명한 파일이 아니면 설치하지 않습니다.
+
+- 서명 파일은 같은 릴리스의 `<zip 파일명>.minisig` 입니다 (예: `URL-Downloader-v0.6.0-macos-universal.zip.minisig`).
+- 서명의 trusted comment 는 `file:<zip 파일명>` 이어야 하고, 릴리스 태그·주소·파일명의 버전이 같으며 현재 버전보다 높아야 설치합니다(예전 버전으로 되돌리기 방지). `--self-update` 도 같은 확인을 거칩니다.
+- 서명 파일이 없거나 맞지 않으면 받은 파일을 지우고 "업데이트 파일의 서명을 확인할 수 없어 설치하지 않습니다" 로 끝납니다.
+- 릴리스 워크플로가 끝나면 개발자가 `scripts/sign-release.sh vX.Y.Z` 로 서명을 만들어 올립니다. 서명 키는 GitHub 에 두지 않습니다.
+
 ## 아이콘
 
 원본은 `assets/icon.png` 입니다. `assets/icon-1024.png`(모서리 투명, 창·Dock 아이콘으로 바이너리에 포함)와
